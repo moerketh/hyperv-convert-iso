@@ -1,0 +1,164 @@
+#!/bin/bash
+set -e
+
+# Script to build a custom ISO that runs the autorun script automatically on boot.
+# Supports BIOS, UEFI, and Secure Boot (Select Microsoft UEFI CA)
+# Assumes 'autorun.sh' script is in the current directory.
+
+WORK_DIR="$HOME/hyperv-convert-iso"
+UBUNTU_VERSION="noble"  # Ubuntu 24.04 LTS
+ISO_NAME="hyperv-convert.iso"
+
+# Cleanup to prevent busy device issues from previous runs
+if [ -d "$WORK_DIR/chroot" ]; then
+    echo "Cleaning up existing chroot directory..."
+    # Lazy unmount all possible mounts (removed fuser to avoid killing system processes)
+    sudo umount -l "$WORK_DIR/chroot/dev/shm" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/dev/pts" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/dev/hugepages" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/dev/mqueue" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/dev" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/run" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/proc" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/sys" 2>/dev/null || true
+    # Check for remaining mounts
+    if mount | grep -q "$WORK_DIR/chroot"; then
+        echo "Warning: Some mounts still active. Run 'mount | grep chroot' and unmount manually before re-running."
+        exit 1
+    fi
+    sudo rm -rf "$WORK_DIR/chroot"
+fi
+
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR"
+
+# Install dependencies
+sudo apt-get update
+sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-amd64-signed shim-signed syslinux syslinux-common mtools dosfstools isolinux genisoimage
+
+# Bootstrap minimal Ubuntu
+sudo debootstrap --arch=amd64 --variant=minbase "$UBUNTU_VERSION" chroot "http://us.archive.ubuntu.com/ubuntu/"
+
+# Copy autorun script to chroot
+sudo cp ./autorun.sh chroot/usr/bin/autorun.sh
+sudo chmod +x chroot/usr/bin/autorun.sh
+
+# Mount binds
+sudo mount --bind /dev chroot/dev
+sudo mount --bind /run chroot/run
+sudo chroot chroot mount -t proc none /proc
+sudo chroot chroot mount -t sysfs none /sys
+sudo chroot chroot mount -t devpts none /dev/pts
+
+sudo cp chroot_setup.sh chroot/
+sudo chroot chroot /bin/bash /chroot_setup.sh
+
+# Unmount
+sudo chroot chroot umount /proc || true
+sudo chroot chroot umount /sys || true
+sudo chroot chroot umount /dev/pts || true
+sudo umount -l chroot/dev/shm 2>/dev/null || true
+sudo umount -l chroot/dev/pts 2>/dev/null || true
+sudo umount -l chroot/dev/hugepages 2>/dev/null || true
+sudo umount -l chroot/dev/mqueue 2>/dev/null || true
+sudo umount chroot/dev
+sudo umount chroot/run
+
+# Prepare image directory
+mkdir -p image/{casper,isolinux,boot/grub}
+touch image/ubuntu  # Create marker file for GRUB search command
+
+# Copy kernel and initrd
+KERNEL_VERSION=$(ls chroot/boot/vmlinuz-* | head -n1 | cut -d- -f2-)
+sudo cp "chroot/boot/vmlinuz-${KERNEL_VERSION}" image/casper/vmlinuz
+sudo cp "chroot/boot/initrd.img-${KERNEL_VERSION}" image/casper/initrd
+
+# Create manifest
+sudo chroot chroot dpkg-query -W --showformat='${Package} ${Version}\n' > image/casper/filesystem.manifest
+sudo cp image/casper/filesystem.manifest image/casper/filesystem.manifest-desktop
+sudo sed -i '/ubiquity/d' image/casper/filesystem.manifest-desktop
+sudo sed -i '/casper/d' image/casper/filesystem.manifest-desktop
+
+# Compress filesystem
+sudo mksquashfs chroot image/casper/filesystem.squashfs -comp xz -b 1M -Xdict-size 100% -noappend -no-duplicates -no-recovery -wildcards -e "var/cache/apt/archives/*" "root/*" "root/.*" "tmp/*" "tmp/.*" "swapfile" "boot/*" "usr/lib/python*" "usr/bin/python*"
+
+# Print filesystem size
+printf $(sudo du -sx --block-size=1 chroot | cut -f1) > image/casper/filesystem.size
+
+# Access image directory
+cd image
+
+# Copy custom grub config
+sudo cp ../grub.cfg isolinux/grub.cfg
+
+# Copy EFI loaders
+sudo cp /usr/lib/shim/shimx64.efi.signed isolinux/bootx64.efi
+sudo cp /usr/lib/shim/mmx64.efi isolinux/mmx64.efi
+sudo cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed isolinux/grubx64.efi
+
+# Create a FAT16 UEFI boot disk image containing the EFI bootloaders
+(
+   cd isolinux && \
+   dd if=/dev/zero of=efiboot.img bs=1M count=10 && \
+   mkfs.vfat -F 16 efiboot.img && \
+   LC_CTYPE=C mmd -i efiboot.img efi efi/ubuntu efi/boot && \
+   LC_CTYPE=C mcopy -i efiboot.img ./bootx64.efi ::efi/boot/bootx64.efi && \
+   LC_CTYPE=C mcopy -i efiboot.img ./mmx64.efi ::efi/boot/mmx64.efi && \
+   LC_CTYPE=C mcopy -i efiboot.img ./grubx64.efi ::efi/boot/grubx64.efi && \
+   LC_CTYPE=C mcopy -i efiboot.img ./grub.cfg ::efi/ubuntu/grub.cfg
+)
+
+# Create a grub BIOS image
+grub-mkstandalone \
+   --format=i386-pc \
+   --output=isolinux/core.img \
+   --install-modules="linux16 linux normal iso9660 biosdisk memdisk search tar ls" \
+   --modules="linux16 linux normal iso9660 biosdisk search" \
+   --locales="" \
+   --fonts="" \
+   "boot/grub/grub.cfg=isolinux/grub.cfg"
+
+# Combine a bootable Grub cdboot.img
+cat /usr/lib/grub/i386-pc/cdboot.img isolinux/core.img > isolinux/bios.img
+
+# Generate md5sum.txt
+sudo /bin/bash -c "(find . -type f -print0 | xargs -0 md5sum | grep -v -e 'isolinux' > md5sum.txt)"
+
+# Create ISO
+sudo xorriso \
+  -as mkisofs \
+  -iso-level 3 \
+  -full-iso9660-filenames \
+  -J -J -joliet-long \
+  -volid "Ubuntu Live" \
+  -output "../${ISO_NAME}" \
+  -eltorito-boot isolinux/bios.img \
+  -no-emul-boot \
+  -boot-load-size 4 \
+  -boot-info-table \
+  --eltorito-catalog boot.catalog \
+  --grub2-boot-info \
+  --grub2-mbr ../chroot/usr/lib/grub/i386-pc/boot_hybrid.img \
+  -partition_offset 16 \
+  --mbr-force-bootable \
+  -eltorito-alt-boot \
+  -no-emul-boot \
+  -e isolinux/efiboot.img \
+  -append_partition 2 28732ac11ff8d211ba4b00a0c93ec93b isolinux/efiboot.img \
+  -appended_part_as_gpt \
+  -iso_mbr_part_type a2a0d0ebe5b9334487c068b6b72699c7 \
+  -m "isolinux/efiboot.img" \
+  -m "isolinux/bios.img" \
+  -e '--interval:appended_partition_2:::' \
+  -exclude isolinux \
+  -graft-points \
+      "/EFI/boot/bootx64.efi=isolinux/bootx64.efi" \
+      "/EFI/boot/mmx64.efi=isolinux/mmx64.efi" \
+      "/EFI/boot/grubx64.efi=isolinux/grubx64.efi" \
+      "/EFI/ubuntu/grub.cfg=isolinux/grub.cfg" \
+      "/isolinux/bios.img=isolinux/bios.img" \
+      "/isolinux/efiboot.img=isolinux/efiboot.img" \
+      "."
+
+cd ..
+echo "ISO created at ${WORK_DIR}/${ISO_NAME}"
