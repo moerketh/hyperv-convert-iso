@@ -1,0 +1,28 @@
+name: Build Hyper-V Convert ISO
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-amd64-signed shim-signed syslinux syslinux-common mtools dosfstools isolinux genisoimage
+
+      - name: Run build script
+        run: ./script.sh
+
+      - name: Upload ISO as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperv-convert-iso
+          path: hyperv-convert.iso
