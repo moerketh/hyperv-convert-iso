@@ -5,7 +5,7 @@ set -e
 # Supports BIOS, UEFI, and Secure Boot (Select Microsoft UEFI CA)
 # Assumes 'autorun.sh' script is in the current directory.
 
-WORK_DIR="$HOME/hyperv-convert-iso"
+WORK_DIR=$(pwd)
 UBUNTU_VERSION="noble"  # Ubuntu 24.04 LTS
 ISO_NAME="hyperv-convert.iso"
 
@@ -29,9 +29,6 @@ if [ -d "$WORK_DIR/chroot" ]; then
     sudo rm -rf "$WORK_DIR/chroot"
 fi
 
-mkdir -p "$WORK_DIR"
-cd "$WORK_DIR"
-
 # Install dependencies
 sudo apt-get update
 sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-amd64-signed shim-signed syslinux syslinux-common mtools dosfstools isolinux genisoimage
@@ -40,7 +37,7 @@ sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-
 sudo debootstrap --arch=amd64 --variant=minbase "$UBUNTU_VERSION" chroot "http://us.archive.ubuntu.com/ubuntu/"
 
 # Copy autorun script to chroot
-sudo cp ./autorun.sh chroot/usr/bin/autorun.sh
+sudo cp autorun.sh chroot/usr/bin/autorun.sh
 sudo chmod +x chroot/usr/bin/autorun.sh
 
 # Mount binds
