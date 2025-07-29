@@ -2,9 +2,7 @@
 set -e
 
 export HOME=/root
-export LC_ALL=C
-
-echo "ubuntu-live" > /etc/hostname
+echo "autorun" > /etc/hostname
 
 cat << EOT > /etc/apt/sources.list
 deb http://us.archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
@@ -58,9 +56,9 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c "/usr/bin/autorun.sh"
+ExecStart=/bin/bash -c "/opt/autorun/autorun.sh"
 StandardOutput=journal+console
-StandardError=file:/var/log/autorun.err
+StandardError=journal+console
 RemainAfterExit=no
 OnSuccess=poweroff.target
 ExecStartPost=/bin/sh -c '[ $? = 0 ] && /usr/bin/systemctl poweroff'

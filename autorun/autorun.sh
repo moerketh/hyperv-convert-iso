@@ -38,6 +38,7 @@ sgdisk --new=2::0 --typecode=2:8300 --change-name=2:root $new_disk         # Roo
 partprobe $new_disk
 
 # Format partitions
+sleep 1
 mkfs.vfat -F32 ${new_disk}1
 mkfs.ext4 ${new_disk}2
 
@@ -107,7 +108,15 @@ if [ ! -z "$esp_device" ]; then
     esp_part=$(blkid -L "$label")
     old_esp_label="$label"
   elif [[ "$esp_device" == /dev/* ]]; then
-    esp_part="$esp_device"
+    # Remap device to current old_disk if necessary
+    if [[ "$esp_device" == ${old_disk}* ]]; then
+      esp_part="$esp_device"
+    else
+      # Original device uses different letter; remap to old_disk
+      part_num=$(echo "$esp_device" | sed 's/^\/dev\/sd[a-z]\([0-9]*\)$/\1/')
+      esp_part="${old_disk}${part_num}"
+      echo "Remapped ESP device from $esp_device to $esp_part"
+    fi
     old_esp_uuid=$(blkid -s UUID -o value "$esp_part")
   fi
   if [ -z "$esp_part" ]; then
@@ -135,7 +144,15 @@ if [ ! -z "$boot_device" ]; then
     boot_part=$(blkid -L "$label")
     old_boot_label="$label"
   elif [[ "$boot_device" == /dev/* ]]; then
-    boot_part="$boot_device"
+    # Remap device to current old_disk if necessary
+    if [[ "$boot_device" == ${old_disk}* ]]; then
+      boot_part="$boot_device"
+    else
+      # Original device uses different letter; remap to old_disk
+      part_num=$(echo "$boot_device" | sed 's/^\/dev\/sd[a-z]\([0-9]*\)$/\1/')
+      boot_part="${old_disk}${part_num}"
+      echo "Remapped boot device from $boot_device to $boot_part"
+    fi
     old_boot_uuid=$(blkid -s UUID -o value "$boot_part")
   fi
   if [ -z "$boot_part" ]; then
@@ -206,15 +223,14 @@ if [ -f "$fstab_path" ]; then
   # Remove separate /boot entry if merged
   if [ ! -z "$boot_part" ]; then
     echo "Removing separate /boot entry from fstab."
-    if [ ! -z "$old_boot_uuid" ]; then
+    #if [ ! -z "$old_boot_uuid" ]; then
       sed -i "/UUID=$old_boot_uuid/d" "$fstab_path"
-    elif [ ! -z "$old_boot_label" ]; then
+    #elif [ ! -z "$old_boot_label" ]; then
       sed -i "/LABEL=$old_boot_label/d" "$fstab_path"
-    else
-      # Fallback to device
+    #elif [[ "$boot_device" == /dev/* ]]; then
       boot_device_esc=$(echo "$boot_device" | sed 's/\//\\\//g')
       sed -i "/^$boot_device_esc[ \t]/d" "$fstab_path"
-    fi
+    #fi
   fi
 else
   echo "fstab not found after cloning, creating a new one with root and ESP entries."
@@ -229,64 +245,26 @@ fi
 mount --bind /dev /mnt/new/dev
 mount --bind /proc /mnt/new/proc
 mount --bind /sys /mnt/new/sys
-mount --bind /run /mnt/new/run
+#mount --bind /run /mnt/new/run
 mount --bind /dev/pts /mnt/new/dev/pts
 modprobe efivarfs
 mount --bind /sys/firmware/efi/efivars /mnt/new/sys/firmware/efi/efivars || true
 mount --bind /etc/resolv.conf /mnt/new/etc/resolv.conf || cp -L /etc/resolv.conf /mnt/new/etc/resolv.conf
 
+# copy autorun files
+mkdir -p /mnt/new/opt/autorun
+cp /opt/autorun/* /mnt/new/opt/autorun
 
-. /mnt/new/etc/os-release
-if [ "$ID" = "arch" ]; then
-  # Install GRUB (Arch)
-  chroot /mnt/new /bin/bash -c "
-    pacman -Syy --noconfirm
-    pacman -S --noconfirm archlinux-keyring blackarch-keyring
-    pacman -S --noconfirm --overwrite '/usr/lib/initcpio/*' mkinitcpio
-    pacman -S --noconfirm grub efibootmgr os-prober
-    export PATH=$PATH:/usr/sbin:/sbin
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB $new_disk
-    grub-mkconfig -o /boot/grub/grub.cfg
-"
-elif [ "$ID" = "debian" ]; then
-  # Install GRUB (Debian)
-  chroot /mnt/new /bin/bash -c "
-    apt-get update --allow-releaseinfo-change -y
-    apt-get install -y grub-efi-amd64 efibootmgr os-prober
-    export PATH=$PATH:/usr/sbin:/sbin
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB $new_disk
-    update-grub
-"
-else
-    echo "Unknown distribution: $ID"
-    exit 1
-fi
+# Install grub with UEFI support
+chroot /mnt/new /bin/bash /opt/autorun/install_grub.sh "$new_disk"
+rm /mnt/new/opt/autorun/install_grub.sh
 
-if [ "$ID" = "arch" ]; then
-  # Install GRUB (Arch)
-  chroot /mnt/new /bin/bash -c "
-    pacman -S --noconfirm xrdp
-"
-elif [ "$ID" = "debian" ]; then
-  # Install GRUB (Debian)
-  chroot /mnt/new /bin/bash -c "
-    apt install -y xrdp
-    adduser xrdp ssl-cert
-    sed -i '/^\[Globals\]/,/^\[/{s/^port=.*/port=vsock:\/\/-1:3389/}' /etc/xrdp/xrdp.ini
-    sed -i '/^\[Globals\]/,/^\[/{s/^security_layer=.*/security_layer=rdp/}' /etc/xrdp/xrdp.ini
-    sed -i '/^\[Globals\]/,/^\[/{s/^crypt_level=.*/crypt_level=none/}' /etc/xrdp/xrdp.ini
-    sed -i '/^\[Sessions\]/,/^\[/{s/^X11DisplayOffset=.*/X11DisplayOffset=0/}' /etc/xrdp/sesman.ini
-    systemctl enable xrdp
-    systemctl enable xrdp-sesman
-    systemctl start xrdp
-"
-else
-    exit 1
-fi
+# Install xrdp for Hyper-V Enhanced Session support
+chroot /mnt/new /bin/bash /opt/autorun/install_xrdp.sh
+rm /mnt/new/opt/autorun/install_xrdp.sh
 
-if grep -q "pwnedlabs" /etc/group; then
-    /opt/VBoxGuestAdditions-*/uninstall.sh || true #ignore failure
-fi
+# Remove Virtual Box additions
+/opt/VBoxGuestAdditions-*/uninstall.sh || true #ignore failure
 
 echo "autorun completed"
 touch /run/autorun-done

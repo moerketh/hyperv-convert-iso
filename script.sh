@@ -37,8 +37,19 @@ sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-
 sudo debootstrap --arch=amd64 --variant=minbase "$UBUNTU_VERSION" chroot "http://us.archive.ubuntu.com/ubuntu/"
 
 # Copy autorun script to chroot
-sudo cp autorun.sh chroot/usr/bin/autorun.sh
-sudo chmod +x chroot/usr/bin/autorun.sh
+source_dir="./autorun"
+dest_dir="chroot/opt/autorun"
+sudo mkdir -p $dest_dir
+
+for file in "$source_dir"/*.sh; do
+  if [ -f "$file" ]; then
+    filename=$(basename "$file")
+    sudo cp "$file" "$dest_dir/$filename"
+    sudo chmod +x "$dest_dir/$filename"
+  else
+    echo "No .sh files found in $source_dir, skipping."
+  fi
+done
 
 # Mount binds
 sudo mount --bind /dev chroot/dev
@@ -47,8 +58,10 @@ sudo chroot chroot mount -t proc none /proc
 sudo chroot chroot mount -t sysfs none /sys
 sudo chroot chroot mount -t devpts none /dev/pts
 
-sudo cp chroot_setup.sh chroot/
-sudo chroot chroot /bin/bash /chroot_setup.sh
+# Setup autorun script
+sudo cp ./chroot_setup.sh chroot/tmp/chroot_setup.sh 
+sudo cp ./autorun/* chroot/opt/autorun
+sudo chroot chroot /bin/bash /tmp/chroot_setup.sh
 
 # Unmount
 sudo chroot chroot umount /proc || true
@@ -93,17 +106,21 @@ sudo cp /usr/lib/shim/shimx64.efi.signed isolinux/bootx64.efi
 sudo cp /usr/lib/shim/mmx64.efi isolinux/mmx64.efi
 sudo cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed isolinux/grubx64.efi
 
-# Create a FAT16 UEFI boot disk image containing the EFI bootloaders
-(
-   cd isolinux && \
-   dd if=/dev/zero of=efiboot.img bs=1M count=10 && \
-   mkfs.vfat -F 16 efiboot.img && \
-   LC_CTYPE=C mmd -i efiboot.img efi efi/ubuntu efi/boot && \
-   LC_CTYPE=C mcopy -i efiboot.img ./bootx64.efi ::efi/boot/bootx64.efi && \
-   LC_CTYPE=C mcopy -i efiboot.img ./mmx64.efi ::efi/boot/mmx64.efi && \
-   LC_CTYPE=C mcopy -i efiboot.img ./grubx64.efi ::efi/boot/grubx64.efi && \
-   LC_CTYPE=C mcopy -i efiboot.img ./grub.cfg ::efi/ubuntu/grub.cfg
-)
+# Create EFI boot image
+dd if=/dev/zero of=${WORK_DIR}/image/isolinux/efiboot.img bs=1M count=10
+mkfs.vfat -F 16 -n "EFI Boot" ${WORK_DIR}/image/isolinux/efiboot.img
+mloop=$(sudo losetup --show -f ${WORK_DIR}/image/isolinux/efiboot.img)
+sudo mkdir -p /mnt/efi
+sudo mount "${mloop}" /mnt/efi
+sudo mkdir -p /mnt/efi/EFI/boot
+sudo mkdir -p /mnt/efi/EFI/ubuntu
+sudo cp ../chroot/usr/lib/shim/shimx64.efi.signed /mnt/efi/EFI/boot/bootx64.efi
+sudo cp ../chroot/usr/lib/shim/mmx64.efi /mnt/efi/EFI/boot/mmx64.efi
+sudo cp ../chroot/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed /mnt/efi/EFI/boot/grubx64.efi
+sudo cp ./isolinux/grub.cfg /mnt/efi/EFI/ubuntu/grub.cfg
+sudo umount /mnt/efi
+sudo losetup -d "${mloop}"
+sudo rm -rf /mnt/efi
 
 # Create a grub BIOS image
 grub-mkstandalone \
