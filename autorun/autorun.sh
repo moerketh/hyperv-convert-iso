@@ -168,7 +168,61 @@ fi
 
 # Clone root
 echo "Cloning root from $root_part to ${new_disk}2"
-partclone.ext4 --force --dev-to-dev --source $root_part --output ${new_disk}2 2>&1
+
+# Function to send KVP (write to custom pool for guest-to-host)
+send_kvp() {
+    local key="$1"
+    local value="$2"
+    local pool="/var/lib/hyperv/.kvp_pool_1"
+    local tmpfile=$(mktemp) || { echo "Failed to create temp file"; exit 1; }
+
+    # Write null-terminated key and pad to 512 bytes with nulls
+    printf "%s\0" "$key" > "$tmpfile"
+    truncate -s 512 "$tmpfile"
+
+    # Append null-terminated value and pad to additional 2048 bytes (total 2560)
+    printf "%s\0" "$value" >> "$tmpfile"
+    truncate -s 2560 "$tmpfile"
+
+    # Append the fixed-size record to the pool
+    cat "$tmpfile" >> "$pool" || { echo "Failed to write to $pool"; rm "$tmpfile"; exit 1; }
+    rm "$tmpfile"
+
+    # Optional: Restart daemon to flush immediately (may not be needed in loop)
+    # systemctl restart hv-kvp-daemon
+}
+
+# Run partclone in background with logfile
+partclone.ext4 --force --dev-to-dev --source $root_part --output ${new_disk}2 --logfile /tmp/partclone.log 2>&1 | tee -a /tmp/partclone_process.log &
+pid=$!
+
+while kill -0 $pid 2>/dev/null; do
+    if [ -f /tmp/partclone_process.log ]; then
+        # Clean last 20 lines (adjust as needed) with ansifilter
+        cleaned=$(tail -n 20 /tmp/partclone_process.log | ansifilter --text)
+        # Parse with awk: focus on Elapsed lines, extract 6th field as percentage (remove % and ,), 7th as rate number
+        progress=$(echo "$cleaned" | awk '
+            /Elapsed:/ {
+                perc = $6;
+                gsub(/[%,\s]/, "", perc);  # Remove %, ,, and any spaces
+                rate = $7;
+                gsub(/[\s]/, "", rate);  # Clean rate if needed
+                print "Progress: " perc "% | Rate: " rate " GB/min"
+            }
+        ' | tail -n 1)  # Take the last matching line to get the most recent update
+        
+        if [ -n "$progress" ]; then
+            send_kvp "PartcloneProgress" "$progress"
+        fi
+    else
+        echo "Waiting for partclone.log to be created..."  # Optional debug message
+    fi
+    sleep 1  # Poll interval
+done
+
+# Send final completion KVP (redundant safeguard)
+send_kvp "PartcloneProgress" "Completed: 100% | Done"
+echo "Partclone conversion completed."
 
 # Clone ESP if detected
 if [ ! -z "$esp_part" ]; then
@@ -260,12 +314,41 @@ chroot /mnt/new /bin/bash /opt/autorun/install_grub.sh "$new_disk"
 rm /mnt/new/opt/autorun/install_grub.sh
 
 # Install xrdp for Hyper-V Enhanced Session support
-chroot /mnt/new /bin/bash /opt/autorun/install_xrdp.sh
+/opt/autorun/install_xrdp.sh
 rm /mnt/new/opt/autorun/install_xrdp.sh
 
 # Remove Virtual Box additions
-/opt/VBoxGuestAdditions-*/uninstall.sh || true #ignore failure
+chroot /mnt/new /bin/bash /opt/VBoxGuestAdditions-*/uninstall.sh || true #ignore failure
 
 echo "autorun completed"
-touch /run/autorun-done
+
+pool_file="/var/lib/hyperv/.kvp_pool_0"
+key_size=512
+value_size=2048
+kvp_index=0
+
+while true; do
+    kvp_start_byte=$((kvp_index * (key_size + value_size)))
+    kvp_key_offset=$kvp_start_byte
+    kvp_value_offset=$((kvp_start_byte + key_size))
+
+    kvp_key=$(dd status=none if="$pool_file" bs=1 skip="$kvp_key_offset" count="$key_size" 2>/dev/null | tr -d '\0')
+    kvp_value=$(dd status=none if="$pool_file" bs=1 skip="$kvp_value_offset" count="$value_size" 2>/dev/null | tr -d '\0')
+
+    if [ -z "$kvp_key" ]; then
+        break
+    fi
+
+    echo "Key: $kvp_key Value: $kvp_value"
+    kvp_index=$((kvp_index + 1))
+done
+
+# Read host-to-guest KVP for debug flag (extrinsic pool)
+DEBUG_FLAG=$(cat /var/lib/hyperv/.kvp_pool_0 | strings | grep VMCREATE_DEBUG -A1 | tail -n1)
+
+if [ "$DEBUG_FLAG" != "true" ]; then
+    echo "Debug flag not set; shutting down."
+else
+    echo "Debug flag set; skipping shutdown for debugging."
+fi
 exit 0

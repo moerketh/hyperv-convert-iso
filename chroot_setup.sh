@@ -36,7 +36,7 @@ systemctl enable systemd-networkd-wait-online
 apt-get install -y grub-pc grub-efi-amd64-signed shim-signed
 
 # Packages for autorun script (disk tools)
-apt-get install -y partclone gdisk e2fsprogs dosfstools rsync lvm2 efibootmgr os-prober grub2-common util-linux parted psmisc
+apt-get install -y partclone gdisk e2fsprogs dosfstools rsync lvm2 efibootmgr os-prober grub2-common util-linux parted psmisc ansifilter binutils
 
 # User setup for debug
 adduser --disabled-password --gecos "" ubuntu
@@ -61,7 +61,7 @@ StandardOutput=journal+console
 StandardError=journal+console
 RemainAfterExit=no
 OnSuccess=poweroff.target
-ExecStartPost=/bin/sh -c '[ $? = 0 ] && /usr/bin/systemctl poweroff'
+ExecStartPost=/bin/sh -c '[ -f /run/autorun-shutdown ] && /usr/bin/systemctl poweroff'
 
 [Install]
 WantedBy=multi-user.target
