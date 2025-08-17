@@ -4,25 +4,36 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-amd64-signed shim-signed syslinux syslinux-common mtools dosfstools isolinux genisoimage
-
       - name: Run build script
         run: ./script.sh
-
-      - name: Upload ISO as artifact
+      - name: Generate SHA256 checksum
+        run: sha256sum hyperv-convert.iso > hyperv-convert.iso.sha256
+      - name: Upload ISO and checksum as artifact
+        if: github.ref_type == 'branch'
         uses: actions/upload-artifact@v4
         with:
           name: hyperv-convert-iso
-          path: hyperv-convert.iso
+          path: |
+            hyperv-convert.iso
+            hyperv-convert.iso.sha256
+      - name: Create release and upload ISO with checksum
+        if: github.ref_type == 'tag'
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: hyperv-convert.iso,hyperv-convert.iso.sha256
+          generateReleaseNotes: false
