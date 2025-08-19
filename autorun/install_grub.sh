@@ -17,7 +17,7 @@ if [ "$ID" = "arch" ]; then
   echo 'Pacman update glibc'
   pacman -S --noconfirm --overwrite '/usr/lib/initcpio/*' mkinitcpio #required for lvm2
   pacman -S --noconfirm --needed glibc lib32-glibc lvm2 device-mapper
-  pacman -S --noconfirm linux hyperv
+  pacman -S --noconfirm linux-lts hyperv
   echo 'Pacman install grub'
   pacman -S --noconfirm grub efibootmgr os-prober
   export PATH=$PATH:/usr/sbin:/sbin

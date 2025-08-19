@@ -20,7 +20,7 @@ fi
 sed -i '/^\[Globals\]/,/^\[/{s/^port=.*/port=vsock:\/\/-1:3389/}' /etc/xrdp/xrdp.ini
 sed -i '/^\[Globals\]/,/^\[/{s/^security_layer=.*/security_layer=rdp/}' /etc/xrdp/xrdp.ini
 sed -i '/^\[Globals\]/,/^\[/{s/^crypt_level=.*/crypt_level=none/}' /etc/xrdp/xrdp.ini
-sed -i '/^\[SessionManager\]/,/^\[/{s/^X11DisplayOffset=.*/X11DisplayOffset=0/}' /etc/xrdp/sesman.ini  # Note: Fixed section name to [SessionManager] if that's accurate; original had [Sessions] but standard is [SessionManager]—verify as needed
+sed -i '/^\[Sessions\]/,/^\[/{s/^X11DisplayOffset=.*/X11DisplayOffset=0/}' /etc/xrdp/sesman.ini
 
 # Enable and start services
 systemctl enable xrdp

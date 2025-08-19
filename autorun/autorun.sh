@@ -313,15 +313,6 @@ cp /opt/autorun/* /mnt/new/opt/autorun
 chroot /mnt/new /bin/bash /opt/autorun/install_grub.sh "$new_disk"
 rm /mnt/new/opt/autorun/install_grub.sh
 
-# Install xrdp for Hyper-V Enhanced Session support
-/opt/autorun/install_xrdp.sh
-rm /mnt/new/opt/autorun/install_xrdp.sh
-
-# Remove Virtual Box additions
-chroot /mnt/new /bin/bash /opt/VBoxGuestAdditions-*/uninstall.sh || true #ignore failure
-
-echo "autorun completed"
-
 pool_file="/var/lib/hyperv/.kvp_pool_0"
 key_size=512
 value_size=2048
@@ -343,11 +334,25 @@ while true; do
     kvp_index=$((kvp_index + 1))
 done
 
-# Read host-to-guest KVP for debug flag (extrinsic pool)
+XRDP_FLAG=$(cat /var/lib/hyperv/.kvp_pool_0 | strings | grep VMCREATE_XRDP -A1 | tail -n1)
+if [ "$XRDP_FLAG" == "true" ]; then
+    echo "Installing xrdp for Hyper-V Enhanced Session support"
+    chroot /mnt/new /bin/bash /opt/autorun/install_xrdp.sh
+    rm /mnt/new/opt/autorun/install_xrdp.sh
+fi
+
+# Remove Virtual Box Guest Additions
+echo "Removing Virtualbox Guest Additions"
+chroot /mnt/new /bin/bash -c 'for d in /opt/VBoxGuestAdditions-*; do "$d/uninstall.sh" || true; done'
+
+echo "autorun completed"
+
+# Read host-to-guest
 DEBUG_FLAG=$(cat /var/lib/hyperv/.kvp_pool_0 | strings | grep VMCREATE_DEBUG -A1 | tail -n1)
 
 if [ "$DEBUG_FLAG" != "true" ]; then
     echo "Debug flag not set; shutting down."
+    shutdown -h now
 else
     echo "Debug flag set; skipping shutdown for debugging."
 fi
