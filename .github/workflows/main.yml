@@ -43,7 +43,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-amd64-signed shim-signed syslinux syslinux-common mtools dosfstools isolinux genisoimage
       - name: Run build script
-        run: ./build.sh
+        run: bash build.sh
       - name: Generate SHA256 checksum
         run: sha256sum hyperv-convert.iso > hyperv-convert.iso.sha256
       - name: Upload ISO and checksum as artifact
