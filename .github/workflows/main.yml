@@ -16,7 +16,7 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get install -y shellcheck
       - name: Run ShellCheck
-        run: shellcheck -S error autorun/*.sh lib/*.sh script.sh chroot_setup.sh
+        run: shellcheck -S error autorun/*.sh lib/*.sh build.sh chroot_setup.sh
 
   test:
     runs-on: ubuntu-latest
