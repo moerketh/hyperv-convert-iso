@@ -9,6 +9,16 @@ WORK_DIR=$(pwd)
 UBUNTU_VERSION="noble"  # Ubuntu 24.04 LTS
 ISO_NAME="hyperv-convert.iso"
 
+# Abort if running on an NTFS/Windows filesystem (e.g. /mnt/c in WSL).
+# debootstrap needs Unix symlinks, device nodes, and proper permissions which NTFS cannot provide.
+fs_type=$(df --output=fstype "$WORK_DIR" 2>/dev/null | tail -1)
+if [[ "$fs_type" == "9p" || "$fs_type" == "drvfs" || "$WORK_DIR" == /mnt/[a-z]/* ]]; then
+    echo "ERROR: This script must be run from a native Linux filesystem, not an NTFS mount ($WORK_DIR)." >&2
+    echo "       debootstrap will fail on NTFS because it cannot create Unix symlinks and device nodes." >&2
+    echo "       Copy the repo to a native path first:  cp -r . ~/hyperv-convert-iso && cd ~/hyperv-convert-iso" >&2
+    exit 1
+fi
+
 # Cleanup to prevent busy device issues from previous runs
 if [ -d "$WORK_DIR/chroot" ]; then
     echo "Cleaning up existing chroot directory..."
@@ -36,10 +46,15 @@ sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-
 # Bootstrap minimal Ubuntu
 sudo debootstrap --arch=amd64 --variant=minbase "$UBUNTU_VERSION" chroot "http://us.archive.ubuntu.com/ubuntu/"
 
-# Copy autorun script to chroot
+# Copy autorun script and lib to chroot
 source_dir="./autorun"
 dest_dir="chroot/opt/autorun"
-sudo mkdir -p $dest_dir
+lib_dir="chroot/opt/lib"
+sudo mkdir -p $dest_dir $lib_dir
+
+# Copy shared library functions (autorun.sh sources ../lib/functions.sh)
+sudo cp ./lib/functions.sh "$lib_dir/functions.sh"
+sudo chmod +x "$lib_dir/functions.sh"
 
 for file in "$source_dir"/*.sh; do
   if [ -f "$file" ]; then

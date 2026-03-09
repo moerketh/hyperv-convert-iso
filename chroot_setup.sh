@@ -38,12 +38,114 @@ apt-get install -y grub-pc grub-efi-amd64-signed shim-signed
 # Packages for autorun script (disk tools)
 apt-get install -y partclone gdisk e2fsprogs dosfstools rsync lvm2 efibootmgr os-prober grub2-common util-linux parted psmisc ansifilter binutils
 
-# User setup for debug
+# Install btrfs-progs for btrfs root filesystem support (e.g. Parrot OS)
+apt-get install -y btrfs-progs
+
+# ── SSH for PowerShell Direct ────────────────────────────────────────
+# Hyper-V PowerShell Direct on Linux guests uses SSH over VMBus (AF_VSOCK).
+# This lets the host run commands inside the ISO guest without any network,
+# which is used for:
+#   1. Automated testing — pull journalctl output from the host terminal
+#   2. Post-boot customization — drive configuration directly instead of KVP signaling
+# Authentication: key-only. The host injects its SSH public key via KVP at boot
+# time. Password auth is disabled for security.
+apt-get install -y openssh-server
+# Disable password auth — key-only access via KVP-injected pubkey
+sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
+# Enable SSH early so it's available before autorun starts
+systemctl enable ssh
+
+# ── PowerShell (pwsh) for PowerShell Direct ──────────────────────────
+# PowerShell Direct (Invoke-Command -VMName) requires pwsh as the SSH
+# subsystem endpoint. Without it, SSH connects but the PS remoting session
+# fails with "A remote session might have ended."
+# See: https://learn.microsoft.com/en-us/powershell/scripting/install/install-ubuntu
+apt-get install -y wget apt-transport-https
+wget -q "https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb" -O /tmp/packages-microsoft-prod.deb
+dpkg -i /tmp/packages-microsoft-prod.deb
+rm /tmp/packages-microsoft-prod.deb
+apt-get update -y
+apt-get install -y powershell
+
+# Configure SSH subsystem for PowerShell remoting
+# This is what Invoke-Command -VMName actually connects to
+echo "Subsystem powershell /usr/bin/pwsh -sshs -NoLogo -NoProfile" >> /etc/ssh/sshd_config
+
+# User setup — ubuntu user for SSH (key-only auth, no password)
 adduser --disabled-password --gecos "" ubuntu
-echo "ubuntu:ubuntu" | chpasswd
 usermod -aG sudo ubuntu
 echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
 chmod 0440 /etc/sudoers.d/ubuntu
+
+# Prepare SSH authorized_keys directory (key injected at runtime via KVP)
+mkdir -p /home/ubuntu/.ssh
+touch /home/ubuntu/.ssh/authorized_keys
+chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+chmod 700 /home/ubuntu/.ssh
+chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+# ── KVP SSH key injection service ────────────────────────────────────
+# Runs early at boot to read the host-injected SSH public key from KVP
+# pool 0 and install it into the ubuntu user's authorized_keys.
+# This enables PowerShell Direct with key-based auth.
+cat << 'KVPKEY' > /opt/autorun/inject_ssh_key.sh
+#!/bin/bash
+# Read SSH public key from host-to-guest KVP and install it
+POOL="/var/lib/hyperv/.kvp_pool_0"
+KEY_SIZE=512
+VALUE_SIZE=2048
+
+# Wait for KVP pool file to appear (up to 30s)
+for i in $(seq 1 30); do
+    [ -f "$POOL" ] && break
+    sleep 1
+done
+[ -f "$POOL" ] || exit 0
+
+# Read VMCREATE_SSH_PUBKEY from KVP pool
+index=0
+while true; do
+    offset=$((index * (KEY_SIZE + VALUE_SIZE)))
+    key=$(dd status=none if="$POOL" bs=1 skip="$offset" count="$KEY_SIZE" 2>/dev/null | tr -d '\0')
+    [ -z "$key" ] && break
+    if [ "$key" = "VMCREATE_SSH_PUBKEY" ]; then
+        value_offset=$((offset + KEY_SIZE))
+        pubkey=$(dd status=none if="$POOL" bs=1 skip="$value_offset" count="$VALUE_SIZE" 2>/dev/null | tr -d '\0')
+        if [ -n "$pubkey" ]; then
+            # Install for ubuntu user
+            mkdir -p /home/ubuntu/.ssh
+            echo "$pubkey" > /home/ubuntu/.ssh/authorized_keys
+            chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+            chmod 700 /home/ubuntu/.ssh
+            chmod 600 /home/ubuntu/.ssh/authorized_keys
+            echo "SSH public key injected for ubuntu user"
+        fi
+        break
+    fi
+    index=$((index + 1))
+done
+KVPKEY
+chmod +x /opt/autorun/inject_ssh_key.sh
+
+# Systemd service to run key injection early in boot
+cat << 'KVPUNIT' > /etc/systemd/system/inject-ssh-key.service
+[Unit]
+Description=Inject SSH public key from Hyper-V KVP
+After=hv-kvp-daemon.service
+Before=ssh.service autorun.service
+Wants=hv-kvp-daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/autorun/inject_ssh_key.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+KVPUNIT
+systemctl enable inject-ssh-key.service
 
 # Create /var/crash to avoid boot error on missing directory
 mkdir -p /var/crash
@@ -52,7 +154,9 @@ mkdir -p /var/crash
 cat << EOU > /etc/systemd/system/autorun.service
 [Unit]
 Description=Run autorun script on boot
-After=multi-user.target
+After=multi-user.target ssh.service
+Wants=ssh.service
+OnSuccess=poweroff.target
 
 [Service]
 Type=oneshot
@@ -60,8 +164,6 @@ ExecStart=/bin/bash -c "/opt/autorun/autorun.sh"
 StandardOutput=journal+console
 StandardError=journal+console
 RemainAfterExit=no
-OnSuccess=poweroff.target
-ExecStartPost=/bin/sh -c '[ -f /run/autorun-shutdown ] && /usr/bin/systemctl poweroff'
 
 [Install]
 WantedBy=multi-user.target

@@ -34,7 +34,7 @@ RUN apt-get install -y --no-install-recommends \
 # Install Testing Tools
 RUN apt-get install -y --no-install-recommends \
     shellcheck \
-    bats-core
+    bats
 
 # Install Node.js LTS
 RUN apt-get install -y --no-install-recommends \

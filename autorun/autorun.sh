@@ -1,202 +1,118 @@
 #!/bin/bash
-set -e
+set -eo pipefail
 
-# Detect disks: new (empty, no partitions) and old (has partitions)
-disks=$(ls /dev/sd? | grep -E '^/dev/sd[a-z]$' | sort)
-new_disk=""
-old_disk=""
-for disk in $disks; do
-  part_count=$(lsblk -l -o NAME -n $disk | wc -l)
-  if [ $part_count -eq 1 ]; then
-    new_disk=$disk
-  else
-    old_disk=$disk
-  fi
+# Source utility functions
+source /opt/autorun/../lib/functions.sh
+
+echo "=== autorun.sh started at $(date -Iseconds) ==="
+
+# ── Diagnostics ──────────────────────────────────────────────────────
+echo "--- Environment ---"
+echo "Kernel: $(uname -r)"
+echo "Hostname: $(hostname)"
+echo "Block devices:"
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>&1 || true
+
+echo "--- Hyper-V KVP daemon status ---"
+systemctl is-active hv_kvp_daemon.service 2>&1 || echo "(service not found or inactive)"
+ls -la /var/lib/hyperv/ 2>&1 || echo "/var/lib/hyperv/ does not exist"
+echo "Pool 0 size: $(stat -c%s /var/lib/hyperv/.kvp_pool_0 2>/dev/null || echo 'N/A') bytes"
+
+echo "--- Dumping all host-to-guest KVP entries (pool 0) ---"
+if [ -f /var/lib/hyperv/.kvp_pool_0 ]; then
+    read_kvp "/var/lib/hyperv/.kvp_pool_0" 2>&1 || \
+        strings /var/lib/hyperv/.kvp_pool_0 2>/dev/null | head -40 || \
+        echo "(unable to dump pool file)"
+else
+    echo "Pool file does not exist yet"
+fi
+echo "---------------------------------------------------"
+
+# ── Wait for Hyper-V KVP daemon to deliver host-to-guest data ────────
+# The host pushes VMCREATE_MODE (and other flags) via WMI after the VM starts,
+# but hv_kvp_daemon may not have flushed them to .kvp_pool_0 by the time
+# autorun.service fires. Retry for up to 30 seconds before falling through
+# to the default (clone) workflow.
+VMCREATE_MODE=""
+for i in $(seq 1 30); do
+    VMCREATE_MODE=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_MODE")
+    if [ -n "$VMCREATE_MODE" ]; then
+        echo "VMCREATE_MODE=$VMCREATE_MODE received after ${i}s"
+        break
+    fi
+    # Also check if there are two sd* block devices (clone scenario doesn't
+    # need VMCREATE_MODE) — if so, no point waiting further.
+    disk_count=$(ls -1 /dev/sd[a-z] 2>/dev/null | wc -l)
+    if [ "$disk_count" -ge 2 ]; then
+        echo "Two disks detected after ${i}s, proceeding with clone workflow (no VMCREATE_MODE needed)"
+        break
+    fi
+    # Log progress every 5 seconds
+    if (( i % 5 == 0 )); then
+        echo "Waiting for KVP... ${i}s elapsed (pool size: $(stat -c%s /var/lib/hyperv/.kvp_pool_0 2>/dev/null || echo 'N/A') bytes, disks: $(ls -1 /dev/sd[a-z] 2>/dev/null | wc -l))"
+    fi
+    sleep 1
 done
 
-if [ -z "$new_disk" ] || [ -z "$old_disk" ]; then
-  echo "Could not detect new (empty) or old disk. Aborting." | tee -a /tmp/error.log
-  exit 1
+echo "--- Post-wait KVP dump ---"
+read_kvp "/var/lib/hyperv/.kvp_pool_0" 2>&1 || \
+    strings /var/lib/hyperv/.kvp_pool_0 2>/dev/null | head -40 || \
+    echo "(unable to dump pool file)"
+
+echo "--- Decision ---"
+echo "VMCREATE_MODE='${VMCREATE_MODE}'"
+echo "Disk count: $(ls -1 /dev/sd[a-z] 2>/dev/null | wc -l)"
+
+if [ "$VMCREATE_MODE" = "customize" ]; then
+    echo "VMCREATE_MODE=customize detected, running customize-only workflow"
+    exec /bin/bash /opt/autorun/customize_only.sh
 fi
 
-# Fallback to size if detection ambiguous
-new_size=$(blockdev --getsz $new_disk)
-old_size=$(blockdev --getsz $old_disk)
-if (( new_size < old_size )); then
-  # Swap if sizes don't match expected
-  temp=$new_disk
-  new_disk=$old_disk
-  old_disk=$temp
-fi
+echo "Falling through to clone workflow"
 
-echo "New disk: $new_disk (size $new_size sectors), Old disk: $old_disk (size $old_size sectors)" | tee -a /tmp/detection.log
+# Set trap for cleanup on script exit
+trap cleanup_mounts EXIT
+
+# Detect disks: new (empty, no partitions) and old (has partitions)
+detect_disks
+
+report_progress "PREFLIGHT" "Disk detection complete"
+
+# Run pre-flight checks before proceeding with disk operations
+preflight_checks
 
 # Partition new disk (GPT with ESP and root)
+report_progress "PARTITION" "Starting disk partitioning"
 sgdisk --zap-all $new_disk
 sgdisk --new=1:2048:+512M --typecode=1:ef00 --change-name=1:ESP $new_disk  # ESP
 sgdisk --new=2::0 --typecode=2:8300 --change-name=2:root $new_disk         # Root (rest, combined boot/root)
-partprobe $new_disk
-
-# Format partitions
-sleep 1
-mkfs.vfat -F32 ${new_disk}1
-mkfs.ext4 ${new_disk}2
+retry 3 1 partprobe "$new_disk"
+udevadm settle
 
 # Detect partitions on old_disk
 echo "Detecting partitions on $old_disk" | tee -a /tmp/clone.log
 
-partitions=$(lsblk -lpno NAME,TYPE $old_disk | grep ' part$' | awk '{print $1}')
+detect_partitions "$old_disk"
 
-temp_check="/tmp/check_root"
-mkdir -p "$temp_check"
+# Format new ESP partition (only needed if no source ESP to clone, but partclone
+# will overwrite it if there is one — cheap to do unconditionally for vfat)
+mkfs.vfat -F32 "${new_disk}1"
 
-root_part=""
-esp_device=""
-boot_device=""
-root_found=false
-
-for part in $partitions; do
-  fs_type=$(blkid -o value -s TYPE "$part")
-
-  if [[ ! "$fs_type" =~ ^ext[234]$ ]]; then
-    continue
-  fi
-
-  # Temporarily mount to check if it's root
-  if mount -o ro "$part" "$temp_check" 2>/dev/null; then
-    if [ -f "$temp_check/etc/fstab" ] && [ -d "$temp_check/bin" ]; then
-      root_found=true
-      root_part="$part"
-      echo "Detected root partition: $root_part (fs: $fs_type)"
-
-      # Parse fstab for /boot and /boot/efi
-      esp_device=$(awk '$2 == "/boot/efi" {print $1}' "$temp_check/etc/fstab")
-      if [ ! -z "$esp_device" ]; then
-        echo "Detected ESP mount in fstab: $esp_device"
-      fi
-
-      boot_device=$(awk '$2 == "/boot" {print $1}' "$temp_check/etc/fstab")
-      if [ ! -z "$boot_device" ]; then
-        echo "Detected separate /boot mount in fstab: $boot_device"
-      fi
-
-      umount "$temp_check"
-      break  # Assume only one root
-    fi
-    umount "$temp_check"
-  fi
-done
-
-rmdir "$temp_check"
-
-if ! $root_found; then
-  echo "Error: No valid root partition found on $old_disk."
-  exit 1
-fi
-
-# Resolve esp_part if esp_device present
-esp_part=""
-old_esp_uuid=""
-old_esp_label=""
-if [ ! -z "$esp_device" ]; then
-  if [[ "$esp_device" == UUID=* ]]; then
-    uuid="${esp_device#UUID=}"
-    esp_part=$(blkid -U "$uuid")
-    old_esp_uuid="$uuid"
-  elif [[ "$esp_device" == LABEL=* ]]; then
-    label="${esp_device#LABEL=}"
-    esp_part=$(blkid -L "$label")
-    old_esp_label="$label"
-  elif [[ "$esp_device" == /dev/* ]]; then
-    # Remap device to current old_disk if necessary
-    if [[ "$esp_device" == ${old_disk}* ]]; then
-      esp_part="$esp_device"
-    else
-      # Original device uses different letter; remap to old_disk
-      part_num=$(echo "$esp_device" | sed 's/^\/dev\/sd[a-z]\([0-9]*\)$/\1/')
-      esp_part="${old_disk}${part_num}"
-      echo "Remapped ESP device from $esp_device to $esp_part"
-    fi
-    old_esp_uuid=$(blkid -s UUID -o value "$esp_part")
-  fi
-  if [ -z "$esp_part" ]; then
-    echo "Warning: Could not resolve ESP partition from $esp_device. Skipping clone."
-  else
-    fs_type=$(blkid -o value -s TYPE "$esp_part")
-    if [ "$fs_type" != "vfat" ]; then
-      echo "Warning: ESP partition $esp_part is not vfat. Skipping clone."
-      esp_part=""
-    fi
-  fi
-fi
-
-# Resolve boot_part if boot_device present
-boot_part=""
-old_boot_uuid=""
-old_boot_label=""
-if [ ! -z "$boot_device" ]; then
-  if [[ "$boot_device" == UUID=* ]]; then
-    uuid="${boot_device#UUID=}"
-    boot_part=$(blkid -U "$uuid")
-    old_boot_uuid="$uuid"
-  elif [[ "$boot_device" == LABEL=* ]]; then
-    label="${boot_device#LABEL=}"
-    boot_part=$(blkid -L "$label")
-    old_boot_label="$label"
-  elif [[ "$boot_device" == /dev/* ]]; then
-    # Remap device to current old_disk if necessary
-    if [[ "$boot_device" == ${old_disk}* ]]; then
-      boot_part="$boot_device"
-    else
-      # Original device uses different letter; remap to old_disk
-      part_num=$(echo "$boot_device" | sed 's/^\/dev\/sd[a-z]\([0-9]*\)$/\1/')
-      boot_part="${old_disk}${part_num}"
-      echo "Remapped boot device from $boot_device to $boot_part"
-    fi
-    old_boot_uuid=$(blkid -s UUID -o value "$boot_part")
-  fi
-  if [ -z "$boot_part" ]; then
-    echo "Warning: Could not resolve /boot partition from $boot_device. Skipping merge."
-  else
-    fs_type=$(blkid -o value -s TYPE "$boot_part")
-    if [[ ! "$fs_type" =~ ^ext[234]$ ]]; then
-      echo "Warning: /boot partition $boot_part is not ext*. Skipping merge."
-      boot_part=""
-    fi
-  fi
-fi
+# Only format root if partclone will NOT overwrite it (shouldn't happen, but guard)
+# partclone.ext4 --dev-to-dev overwrites the partition, so skip mkfs.ext4
 
 # Clone root
+report_progress "CLONE_ROOT" "Starting root partition cloning"
 echo "Cloning root from $root_part to ${new_disk}2"
 
-# Function to send KVP (write to custom pool for guest-to-host)
-send_kvp() {
-    local key="$1"
-    local value="$2"
-    local pool="/var/lib/hyperv/.kvp_pool_1"
-    local tmpfile=$(mktemp) || { echo "Failed to create temp file"; exit 1; }
 
-    # Write null-terminated key and pad to 512 bytes with nulls
-    printf "%s\0" "$key" > "$tmpfile"
-    truncate -s 512 "$tmpfile"
-
-    # Append null-terminated value and pad to additional 2048 bytes (total 2560)
-    printf "%s\0" "$value" >> "$tmpfile"
-    truncate -s 2560 "$tmpfile"
-
-    # Append the fixed-size record to the pool
-    cat "$tmpfile" >> "$pool" || { echo "Failed to write to $pool"; rm "$tmpfile"; exit 1; }
-    rm "$tmpfile"
-
-    # Optional: Restart daemon to flush immediately (may not be needed in loop)
-    # systemctl restart hv-kvp-daemon
-}
 
 # Run partclone in background with logfile
-partclone.ext4 --force --dev-to-dev --source $root_part --output ${new_disk}2 --logfile /tmp/partclone.log 2>&1 | tee -a /tmp/partclone_process.log &
-pid=$!
+# Use a named pipe so we can capture partclone's exit code directly
+partclone.ext4 --force --dev-to-dev --source "$root_part" --output "${new_disk}2" --logfile /tmp/partclone.log 2>&1 | tee -a /tmp/partclone_process.log &
+clone_pipeline_pid=$!
 
-while kill -0 $pid 2>/dev/null; do
+while kill -0 $clone_pipeline_pid 2>/dev/null; do
     if [ -f /tmp/partclone_process.log ]; then
         # Clean last 20 lines (adjust as needed) with ansifilter
         cleaned=$(tail -n 20 /tmp/partclone_process.log | ansifilter --text)
@@ -210,7 +126,7 @@ while kill -0 $pid 2>/dev/null; do
                 print "Progress: " perc "% | Rate: " rate " GB/min"
             }
         ' | tail -n 1)  # Take the last matching line to get the most recent update
-        
+
         if [ -n "$progress" ]; then
             send_kvp "PartcloneProgress" "$progress"
         fi
@@ -220,26 +136,52 @@ while kill -0 $pid 2>/dev/null; do
     sleep 1  # Poll interval
 done
 
-# Send final completion KVP (redundant safeguard)
+# Wait for the pipeline to finish and check exit code (pipefail ensures partclone failures propagate)
+wait $clone_pipeline_pid
+clone_exit=$?
+if [ $clone_exit -ne 0 ]; then
+    report_progress "CLONE_ERROR" "Root partition cloning failed with exit code $clone_exit"
+    echo "ERROR: partclone.ext4 failed with exit code $clone_exit" | tee -a /tmp/error.log
+    exit 1
+fi
+
+# Send final completion KVP
 send_kvp "PartcloneProgress" "Completed: 100% | Done"
 echo "Partclone conversion completed."
 
 # Clone ESP if detected
-if [ ! -z "$esp_part" ]; then
+if [ -n "$esp_part" ]; then
+  report_progress "CLONE_ESP" "Starting ESP partition cloning"
   echo "Cloning ESP from $esp_part to ${new_disk}1"
-  partclone.vfat --force --dev-to-dev --source $esp_part --output ${new_disk}1 2>&1
+  partclone.vfat --force --dev-to-dev --source "$esp_part" --output "${new_disk}1" 2>&1
+  esp_clone_exit=$?
+  if [ $esp_clone_exit -ne 0 ]; then
+      report_progress "CLONE_ERROR" "ESP cloning failed with exit code $esp_clone_exit"
+      echo "ERROR: partclone.vfat failed with exit code $esp_clone_exit" | tee -a /tmp/error.log
+      exit 1
+  fi
 else
   echo "No ESP detected on old disk (new ESP will be populated by grub-install)."
 fi
 
+# Verify cloned partitions are clean
+report_progress "VERIFY" "Verifying cloned filesystems"
+if verify_clone "${new_disk}2" "${new_disk}1"; then
+    echo "Filesystem verification PASSED"
+else
+    echo "ERROR: Filesystem verification FAILED" | tee -a /tmp/error.log
+    exit 1
+fi
+
 # Mount new root and ESP
 mkdir -p /mnt/new
-mount ${new_disk}2 /mnt/new
+retry 3 1 mount ${new_disk}2 /mnt/new
 mkdir -p /mnt/new/boot/efi
-mount ${new_disk}1 /mnt/new/boot/efi
+retry 3 1 mount ${new_disk}1 /mnt/new/boot/efi
 
 # Merge separate /boot if detected
 if [ ! -z "$boot_part" ]; then
+  report_progress "MERGE_BOOT" "Merging separate /boot partition"
   echo "Merging /boot from $boot_part into /mnt/new/boot/"
   temp_old_boot="/tmp/old_boot"
   mkdir -p "$temp_old_boot"
@@ -250,50 +192,8 @@ if [ ! -z "$boot_part" ]; then
 fi
 
 # Update fstab with new UUIDs
-fstab_path="/mnt/new/etc/fstab"
-echo "Updating fstab at $fstab_path"
-
-old_root_uuid=$(blkid -s UUID -o value $root_part)
-new_esp_uuid=$(blkid -s UUID -o value ${new_disk}1)
-new_root_uuid=$(blkid -s UUID -o value ${new_disk}2)
-
-if [ -f "$fstab_path" ]; then
-  # Replace root UUID
-  sed -i "s/$old_root_uuid/$new_root_uuid/g" "$fstab_path"
-
-  # Handle ESP
-  if [ ! -z "$esp_part" ]; then
-    if [ -z "$old_esp_uuid" ]; then old_esp_uuid=$(blkid -s UUID -o value $esp_part); fi
-    sed -i "s/$old_esp_uuid/$new_esp_uuid/g" "$fstab_path"
-  else
-    if ! grep -q '/boot/efi' "$fstab_path"; then
-      echo "Adding new /boot/efi entry to fstab."
-      echo "UUID=$new_esp_uuid /boot/efi vfat defaults 0 2" >> "$fstab_path"
-    else
-      echo "/boot/efi already in fstab; no addition needed."
-    fi
-  fi
-
-  # Remove separate /boot entry if merged
-  if [ ! -z "$boot_part" ]; then
-    echo "Removing separate /boot entry from fstab."
-    #if [ ! -z "$old_boot_uuid" ]; then
-      sed -i "/UUID=$old_boot_uuid/d" "$fstab_path"
-    #elif [ ! -z "$old_boot_label" ]; then
-      sed -i "/LABEL=$old_boot_label/d" "$fstab_path"
-    #elif [[ "$boot_device" == /dev/* ]]; then
-      boot_device_esc=$(echo "$boot_device" | sed 's/\//\\\//g')
-      sed -i "/^$boot_device_esc[ \t]/d" "$fstab_path"
-    #fi
-  fi
-else
-  echo "fstab not found after cloning, creating a new one with root and ESP entries."
-  mkdir -p /mnt/new/etc
-  cat << EOF > "$fstab_path"
-UUID=$new_root_uuid / ext4 defaults 0 1
-UUID=$new_esp_uuid /boot/efi vfat defaults 0 2
-EOF
-fi
+report_progress "UPDATE_FSTAB" "Updating fstab with new UUIDs"
+update_fstab "/mnt/new/etc/fstab" "$root_part" "${new_disk}1" "${new_disk}2"
 
 # Bind mounts for chroot
 mount --bind /dev /mnt/new/dev
@@ -310,50 +210,124 @@ mkdir -p /mnt/new/opt/autorun
 cp /opt/autorun/* /mnt/new/opt/autorun
 
 # Install grub with UEFI support
+report_progress "INSTALL_GRUB" "Installing GRUB bootloader"
 chroot /mnt/new /bin/bash /opt/autorun/install_grub.sh "$new_disk"
 rm /mnt/new/opt/autorun/install_grub.sh
 
-pool_file="/var/lib/hyperv/.kvp_pool_0"
-key_size=512
-value_size=2048
-kvp_index=0
+# ── Hyper-V guest optimization ───────────────────────────────────────
+# Install daemons that make the guest a first-class Hyper-V citizen.
+# Non-fatal: if the distro can't install these, the VM still works.
+report_progress "HYPERV_OPTIMIZE" "Installing Hyper-V guest integration services"
+echo "Installing Hyper-V guest optimizations..."
+if chroot /mnt/new /bin/bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y -qq
+        apt-get install -y -qq hyperv-daemons openssh-server 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q hyperv-daemons openssh-server 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q hyperv-daemons openssh-server 2>&1
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm hyperv openssh 2>&1
+    else
+        echo "Unknown package manager — skipping Hyper-V optimization"
+        exit 1
+    fi
+    systemctl enable hv_kvp_daemon.service 2>/dev/null || true
+    systemctl enable hv_vss_daemon.service 2>/dev/null || true
+    systemctl enable hv_fcopy_daemon.service 2>/dev/null || true
+    systemctl enable ssh.service 2>/dev/null || systemctl enable sshd.service 2>/dev/null || true
+'; then
+    echo "Hyper-V guest optimization completed successfully"
+else
+    report_progress "HYPERV_OPTIMIZE_WARNING" "Hyper-V optimization partially failed (non-fatal)"
+    echo "WARNING: Some Hyper-V optimizations could not be installed (non-fatal)" | tee -a /tmp/error.log
+fi
 
-while true; do
-    kvp_start_byte=$((kvp_index * (key_size + value_size)))
-    kvp_key_offset=$kvp_start_byte
-    kvp_value_offset=$((kvp_start_byte + key_size))
+# Read KVP flags using the proper binary reader
+XRDP_FLAG=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_XRDP")
+if [ "$XRDP_FLAG" = "true" ]; then
+    report_progress "INSTALL_XRDP" "Installing XRDP for Enhanced Session support"
+    echo "Installing xrdp for Hyper-V Enhanced Session support"
+    # Non-fatal: a failed XRDP install should not invalidate a successful conversion
+    if chroot /mnt/new /bin/bash /opt/autorun/install_xrdp.sh; then
+        echo "XRDP installation completed successfully"
+    else
+        report_progress "XRDP_WARNING" "XRDP installation failed, VM will boot without XRDP"
+        echo "WARNING: XRDP installation failed, continuing..." | tee -a /tmp/error.log
+    fi
+    rm -f /mnt/new/opt/autorun/install_xrdp.sh
+fi
 
-    kvp_key=$(dd status=none if="$pool_file" bs=1 skip="$kvp_key_offset" count="$key_size" 2>/dev/null | tr -d '\0')
-    kvp_value=$(dd status=none if="$pool_file" bs=1 skip="$kvp_value_offset" count="$value_size" 2>/dev/null | tr -d '\0')
+# ── Install pwsh for PowerShell Direct on target VM ──────────────────
+# Required for post-boot customization via Invoke-Command -VMName.
+report_progress "INSTALL_PWSH" "Installing PowerShell for post-boot configuration"
+echo "Installing PowerShell on target VM..."
+if chroot /mnt/new /bin/bash /opt/autorun/install_pwsh.sh; then
+    echo "PowerShell installation completed successfully"
+else
+    report_progress "PWSH_WARNING" "PowerShell installation failed (post-boot config will not be available)"
+    echo "WARNING: PowerShell installation failed, continuing..." | tee -a /tmp/error.log
+fi
+rm -f /mnt/new/opt/autorun/install_pwsh.sh
 
-    if [ -z "$kvp_key" ]; then
+# ── Create automation user and inject SSH key on target VM ───────────
+# The 'vmcreate' user is used by the host for post-boot SSH connections.
+# The SSH public key is sent via KVP from the host — retry for up to 30s
+# in case the KVP hasn't been flushed yet (hv_kvp_daemon latency).
+report_progress "SSH_SETUP" "Setting up automation user and SSH key on target VM"
+SSH_PUBKEY=""
+for i in $(seq 1 30); do
+    SSH_PUBKEY=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_SSH_PUBKEY")
+    if [ -n "$SSH_PUBKEY" ]; then
+        echo "VMCREATE_SSH_PUBKEY received after ${i}s (${#SSH_PUBKEY} bytes)"
         break
     fi
-
-    echo "Key: $kvp_key Value: $kvp_value"
-    kvp_index=$((kvp_index + 1))
+    if (( i % 5 == 0 )); then
+        echo "Waiting for SSH public key in KVP... ${i}s elapsed"
+    fi
+    sleep 1
 done
-
-XRDP_FLAG=$(cat /var/lib/hyperv/.kvp_pool_0 | strings | grep VMCREATE_XRDP -A1 | tail -n1)
-if [ "$XRDP_FLAG" == "true" ]; then
-    echo "Installing xrdp for Hyper-V Enhanced Session support"
-    chroot /mnt/new /bin/bash /opt/autorun/install_xrdp.sh
-    rm /mnt/new/opt/autorun/install_xrdp.sh
+if [ -n "$SSH_PUBKEY" ]; then
+    echo "Injecting SSH key and creating vmcreate automation user on target VM"
+    chroot /mnt/new /bin/bash -c "
+        # Create vmcreate user if it doesn't exist
+        if ! id vmcreate >/dev/null 2>&1; then
+            adduser --disabled-password --gecos 'VMCreate Automation' vmcreate
+            usermod -aG sudo vmcreate
+            echo 'vmcreate ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/vmcreate
+            chmod 0440 /etc/sudoers.d/vmcreate
+        fi
+        # Install SSH public key
+        mkdir -p /home/vmcreate/.ssh
+        echo \"$SSH_PUBKEY\" > /home/vmcreate/.ssh/authorized_keys
+        chown -R vmcreate:vmcreate /home/vmcreate/.ssh
+        chmod 700 /home/vmcreate/.ssh
+        chmod 600 /home/vmcreate/.ssh/authorized_keys
+        # Ensure pubkey auth is enabled
+        sed -i 's/^#\\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+    " || echo "WARNING: SSH key injection failed (non-fatal)" | tee -a /tmp/error.log
+else
+    echo "No SSH public key in KVP — skipping automation user setup"
 fi
 
-# Remove Virtual Box Guest Additions
+# Remove Virtual Box Guest Additions (non-fatal)
 echo "Removing Virtualbox Guest Additions"
-chroot /mnt/new /bin/bash -c 'for d in /opt/VBoxGuestAdditions-*; do "$d/uninstall.sh" || true; done'
+chroot /mnt/new /bin/bash -c 'for d in /opt/VBoxGuestAdditions-*; do "$d/uninstall.sh" || true; done' || true
 
+report_progress "CLEANUP" "Workflow completed successfully"
 echo "autorun completed"
 
-# Read host-to-guest
-DEBUG_FLAG=$(cat /var/lib/hyperv/.kvp_pool_0 | strings | grep VMCREATE_DEBUG -A1 | tail -n1)
+# Read debug flag using proper KVP reader
+DEBUG_FLAG=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_DEBUG")
 
-if [ "$DEBUG_FLAG" != "true" ]; then
-    echo "Debug flag not set; shutting down."
-    shutdown -h now
-else
-    echo "Debug flag set; skipping shutdown for debugging."
+if [ "$DEBUG_FLAG" = "true" ]; then
+    echo "Debug flag set; VM will remain running for inspection."
+    echo "Login via Hyper-V console to inspect. Run 'systemctl poweroff' when done."
+    # Exit with error to prevent OnSuccess=poweroff.target from firing
+    exit 1
 fi
+
+echo "Autorun completed successfully; systemd will handle shutdown via OnSuccess=poweroff.target."
 exit 0

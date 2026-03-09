@@ -10,9 +10,12 @@ curl -fsSL https://opencode.ai/install | bash
 # Add opencode to PATH for current session
 export PATH="$HOME/.opencode/bin:$PATH"
 
+
+
+
 # Install Oh-My-OpenCode (non-interactive)
 echo "Installing Oh-My-OpenCode..."
-bunx oh-my-opencode install --no-tui --claude=no --gemini=no --copilot=no
+bunx oh-my-opencode install --claude=no --gemini=no --copilot=no
 
 # Validate environment
 echo ""

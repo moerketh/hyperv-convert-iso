@@ -1,0 +1,293 @@
+#!/bin/bash
+set -eo pipefail
+
+# Customize-only mode: mount the existing GPT disk, chroot into it,
+# and apply customizations (e.g. install xrdp) without any disk cloning.
+# This is used when a GPT image is already in the correct format
+# but needs post-install customization via the helper ISO.
+
+# Source utility functions
+source /opt/autorun/../lib/functions.sh
+
+# Set trap for cleanup on script exit
+trap cleanup_mounts EXIT
+
+report_progress "CUSTOMIZE_START" "Starting customize-only mode"
+
+# In customize-only mode there is exactly one partitioned disk attached.
+# The ISO boots from DVD; the target disk is the only /dev/sd* device.
+target_disk=""
+for disk in /dev/sd[a-z]; do
+    [ -b "$disk" ] || continue
+    part_count=$(lsblk -l -o NAME -n "$disk" | wc -l)
+    if [ "$part_count" -gt 1 ]; then
+        target_disk="$disk"
+        break
+    fi
+done
+
+if [ -z "$target_disk" ]; then
+    report_progress "CUSTOMIZE_ERROR" "No partitioned disk found"
+    echo "ERROR: Could not find a partitioned disk to customize." | tee -a /tmp/error.log
+    exit 1
+fi
+
+echo "Target disk: $target_disk"
+
+# Detect root and ESP partitions on the target disk
+report_progress "DETECT" "Detecting partitions on target disk"
+
+# Find root partition (ext4 with /etc/fstab)
+root_part=""
+esp_part=""
+root_mount_opts=""
+temp_check="/tmp/check_root"
+mkdir -p "$temp_check"
+
+for part in $(lsblk -lpno NAME,TYPE "$target_disk" | grep ' part$' | awk '{print $1}'); do
+    fs_type=$(blkid -o value -s TYPE "$part" 2>/dev/null || true)
+
+    # Check for ESP (vfat)
+    if [ "$fs_type" = "vfat" ]; then
+        esp_part="$part"
+        echo "Detected ESP: $esp_part"
+        continue
+    fi
+
+    # Check for root (ext2/3/4, btrfs, xfs — anything with fstab + bin)
+    if [[ "$fs_type" =~ ^(ext[234]|btrfs|xfs)$ ]]; then
+        if mount -o ro "$part" "$temp_check" 2>/dev/null; then
+            if [ -f "$temp_check/etc/fstab" ] && [ -d "$temp_check/bin" ]; then
+                root_part="$part"
+                echo "Detected root: $root_part (fs: $fs_type)"
+                umount "$temp_check"
+                break
+            fi
+            umount "$temp_check"
+        fi
+        # btrfs subvolume handling: many distros (Parrot, openSUSE, Fedora)
+        # put root in a subvolume like @ or @rootfs. A plain mount shows
+        # the top-level tree which lacks /etc/fstab and /bin.
+        if [ "$fs_type" = "btrfs" ] && [ -z "$root_part" ]; then
+            for subvol in @ @rootfs; do
+                if mount -o ro,subvol="$subvol" "$part" "$temp_check" 2>/dev/null; then
+                    if [ -f "$temp_check/etc/fstab" ] && [ -d "$temp_check/bin" ]; then
+                        root_part="$part"
+                        root_mount_opts="-o subvol=$subvol"
+                        echo "Detected root: $root_part (fs: $fs_type, subvol: $subvol)"
+                        umount "$temp_check"
+                        break
+                    fi
+                    umount "$temp_check"
+                fi
+            done
+            [ -n "$root_part" ] && break
+        fi
+    fi
+done
+rmdir "$temp_check"
+
+if [ -z "$root_part" ]; then
+    report_progress "CUSTOMIZE_ERROR" "No root partition found on $target_disk"
+    echo "ERROR: Could not find root partition on $target_disk." | tee -a /tmp/error.log
+    exit 1
+fi
+
+# Mount root (with subvolume option if detected)
+mkdir -p /mnt/new
+if [ -n "$root_mount_opts" ]; then
+    retry 3 1 mount $root_mount_opts "$root_part" /mnt/new
+else
+    retry 3 1 mount "$root_part" /mnt/new
+fi
+
+# Mount ESP if found
+if [ -n "$esp_part" ]; then
+    mkdir -p /mnt/new/boot/efi
+    retry 3 1 mount "$esp_part" /mnt/new/boot/efi
+fi
+
+# ── Mount additional fstab entries (e.g. /home on separate partition/subvol) ──
+# Some distros (Ubuntu 24.04+, openSUSE) use a separate btrfs subvolume or
+# partition for /home.  If we don't mount it before chroot, any user/home dirs
+# we create will land on the root subvolume and be hidden when the real /home
+# is mounted at boot.
+mount_fstab_extras() {
+    local fstab="/mnt/new/etc/fstab"
+    [ -f "$fstab" ] || return 0
+
+    # Read fstab, skip comments/empty/swap, skip / and /boot/efi (already mounted)
+    while read -r fs_spec fs_file fs_vfstype fs_mntops _; do
+        [[ "$fs_spec" =~ ^#  ]] && continue
+        [ -z "$fs_spec" ] && continue
+        [ "$fs_vfstype" = "swap" ] && continue
+        [ "$fs_file" = "/" ] && continue
+        [ "$fs_file" = "/boot/efi" ] && continue
+        [ "$fs_file" = "/boot" ] && continue
+        # Only mount real filesystems (skip proc/sys/devpts/tmpfs etc)
+        case "$fs_vfstype" in
+            proc|sysfs|devpts|tmpfs|devtmpfs|cgroup*|securityfs|debugfs|efivarfs|fuse*) continue ;;
+        esac
+
+        local target="/mnt/new${fs_file}"
+        mkdir -p "$target"
+
+        # Handle btrfs subvolumes specified in fstab options
+        if [ "$fs_vfstype" = "btrfs" ]; then
+            local subvol_opt
+            subvol_opt=$(echo "$fs_mntops" | tr ',' '\n' | grep '^subvol=' | head -1)
+            if [ -n "$subvol_opt" ]; then
+                echo "Mounting fstab entry: $fs_file ($fs_vfstype, $subvol_opt)"
+                mount -o "$subvol_opt" "$root_part" "$target" 2>/dev/null && continue
+            fi
+        fi
+
+        # Handle UUID= and LABEL= references
+        local dev="$fs_spec"
+        if [[ "$fs_spec" =~ ^UUID= ]]; then
+            dev=$(blkid -U "${fs_spec#UUID=}" 2>/dev/null || true)
+        elif [[ "$fs_spec" =~ ^LABEL= ]]; then
+            dev=$(blkid -L "${fs_spec#LABEL=}" 2>/dev/null || true)
+        fi
+
+        if [ -n "$dev" ] && [ -b "$dev" ]; then
+            echo "Mounting fstab entry: $fs_file ($fs_vfstype, $dev)"
+            mount -t "$fs_vfstype" "$dev" "$target" 2>/dev/null || \
+                echo "WARNING: Failed to mount fstab $fs_file — user home dirs may not persist" | tee -a /tmp/error.log
+        fi
+    done < "$fstab"
+}
+mount_fstab_extras
+
+# Bind mounts for chroot
+mount --bind /dev /mnt/new/dev
+mount --bind /proc /mnt/new/proc
+mount --bind /sys /mnt/new/sys
+mount --bind /dev/pts /mnt/new/dev/pts
+modprobe efivarfs
+mount --bind /sys/firmware/efi/efivars /mnt/new/sys/firmware/efi/efivars || true
+mount --bind /etc/resolv.conf /mnt/new/etc/resolv.conf || cp -L /etc/resolv.conf /mnt/new/etc/resolv.conf
+
+# Copy autorun files for chroot scripts
+mkdir -p /mnt/new/opt/autorun
+cp /opt/autorun/install_xrdp.sh /mnt/new/opt/autorun/ 2>/dev/null || true
+cp /opt/autorun/install_pwsh.sh /mnt/new/opt/autorun/ 2>/dev/null || true
+
+# ── Hyper-V guest optimization ───────────────────────────────────────
+# Install daemons that make the guest a first-class Hyper-V citizen:
+#   - hv_kvp_daemon:   Key-Value Pair exchange (host↔guest signaling)
+#   - hv_vss_daemon:   VSS snapshots / live checkpoints
+#   - hv_fcopy_daemon: Host-to-guest file copy service
+#   - openssh-server:  Enables PowerShell Direct (SSH over VMBus/hv_sock)
+#
+# These are safe additions — they don't replace the kernel or modify
+# distro-specific configurations, just add integration daemons.
+# Non-fatal: if the distro can't install these, the VM still works.
+report_progress "HYPERV_OPTIMIZE" "Installing Hyper-V guest integration services"
+echo "Installing Hyper-V guest optimizations..."
+if chroot /mnt/new /bin/bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+    # Try apt (Debian/Ubuntu/Parrot/Kali) then dnf/yum (Fedora/RHEL)
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y -qq
+        apt-get install -y -qq hyperv-daemons openssh-server 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q hyperv-daemons openssh-server 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q hyperv-daemons openssh-server 2>&1
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm hyperv openssh 2>&1
+    else
+        echo "Unknown package manager — skipping Hyper-V optimization"
+        exit 1
+    fi
+    # Enable services so they start on next boot
+    systemctl enable hv_kvp_daemon.service 2>/dev/null || true
+    systemctl enable hv_vss_daemon.service 2>/dev/null || true
+    systemctl enable hv_fcopy_daemon.service 2>/dev/null || true
+    systemctl enable ssh.service 2>/dev/null || systemctl enable sshd.service 2>/dev/null || true
+'; then
+    echo "Hyper-V guest optimization completed successfully"
+else
+    report_progress "HYPERV_OPTIMIZE_WARNING" "Hyper-V optimization partially failed (non-fatal)"
+    echo "WARNING: Some Hyper-V optimizations could not be installed (non-fatal)" | tee -a /tmp/error.log
+fi
+
+# Read KVP flags
+XRDP_FLAG=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_XRDP")
+if [ "$XRDP_FLAG" = "true" ]; then
+    report_progress "INSTALL_XRDP" "Installing XRDP for Enhanced Session support"
+    echo "Installing xrdp for Hyper-V Enhanced Session support"
+    # Non-fatal: a failed XRDP install should not invalidate a successful customization
+    if chroot /mnt/new /bin/bash /opt/autorun/install_xrdp.sh; then
+        echo "XRDP installation completed successfully"
+    else
+        report_progress "XRDP_WARNING" "XRDP installation failed, VM will boot without XRDP"
+        echo "WARNING: XRDP installation failed, continuing..." | tee -a /tmp/error.log
+    fi
+    rm -f /mnt/new/opt/autorun/install_xrdp.sh
+fi
+
+# ── Install pwsh for PowerShell Direct on target VM ──────────────────
+report_progress "INSTALL_PWSH" "Installing PowerShell for post-boot configuration"
+echo "Installing PowerShell on target VM..."
+if chroot /mnt/new /bin/bash /opt/autorun/install_pwsh.sh; then
+    echo "PowerShell installation completed successfully"
+else
+    report_progress "PWSH_WARNING" "PowerShell installation failed (post-boot config will not be available)"
+    echo "WARNING: PowerShell installation failed, continuing..." | tee -a /tmp/error.log
+fi
+rm -f /mnt/new/opt/autorun/install_pwsh.sh
+
+# ── Create automation user and inject SSH key on target VM ───────────
+# Retry for up to 30s — KVP may not have been flushed by hv_kvp_daemon yet.
+report_progress "SSH_SETUP" "Setting up automation user and SSH key on target VM"
+SSH_PUBKEY=""
+for i in $(seq 1 30); do
+    SSH_PUBKEY=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_SSH_PUBKEY")
+    if [ -n "$SSH_PUBKEY" ]; then
+        echo "VMCREATE_SSH_PUBKEY received after ${i}s (${#SSH_PUBKEY} bytes)"
+        break
+    fi
+    if (( i % 5 == 0 )); then
+        echo "Waiting for SSH public key in KVP... ${i}s elapsed"
+    fi
+    sleep 1
+done
+if [ -n "$SSH_PUBKEY" ]; then
+    echo "Injecting SSH key and creating vmcreate automation user on target VM"
+    chroot /mnt/new /bin/bash -c "
+        # Create vmcreate user if it doesn't exist
+        if ! id vmcreate >/dev/null 2>&1; then
+            adduser --disabled-password --gecos 'VMCreate Automation' vmcreate
+            usermod -aG sudo vmcreate
+            echo 'vmcreate ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/vmcreate
+            chmod 0440 /etc/sudoers.d/vmcreate
+        fi
+        # Install SSH public key
+        mkdir -p /home/vmcreate/.ssh
+        echo \"$SSH_PUBKEY\" > /home/vmcreate/.ssh/authorized_keys
+        chown -R vmcreate:vmcreate /home/vmcreate/.ssh
+        chmod 700 /home/vmcreate/.ssh
+        chmod 600 /home/vmcreate/.ssh/authorized_keys
+        # Ensure pubkey auth is enabled
+        sed -i 's/^#\\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+    " || echo "WARNING: SSH key injection failed (non-fatal)" | tee -a /tmp/error.log
+else
+    echo "No SSH public key in KVP — skipping automation user setup"
+fi
+
+report_progress "CLEANUP" "Customization completed successfully"
+echo "Customize-only mode completed"
+
+# Read debug flag
+DEBUG_FLAG=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_DEBUG")
+
+if [ "$DEBUG_FLAG" = "true" ]; then
+    echo "Debug flag set; VM will remain running for inspection."
+    echo "Login via Hyper-V console to inspect. Run 'systemctl poweroff' when done."
+    exit 1
+fi
+
+echo "Customization completed successfully; systemd will handle shutdown via OnSuccess=poweroff.target."
+exit 0

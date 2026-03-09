@@ -1,3 +1,4 @@
 chroot/
 image/
 hyperv-convert.iso
+.sisyphus/*

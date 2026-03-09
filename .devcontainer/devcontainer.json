@@ -4,7 +4,7 @@
     "dockerfile": "Dockerfile",
     "context": "."
   },
-  "runArgs": ["--privileged"],
+  "runArgs": ["--privileged", "--device=/dev:/dev"],
   "customizations": {
     "vscode": {
       "extensions": [
