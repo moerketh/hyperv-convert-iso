@@ -92,7 +92,10 @@ chmod 600 /home/ubuntu/.ssh/authorized_keys
 # This enables PowerShell Direct with key-based auth.
 cat << 'KVPKEY' > /opt/autorun/inject_ssh_key.sh
 #!/bin/bash
-# Read SSH public key from host-to-guest KVP and install it
+# Read SSH public key from host-to-guest KVP and install it.
+# The host sends the key ~12-15s after VM boot (after a 10s settle
+# delay + padding KVPs). Retry for up to 60s so the key has time
+# to arrive via hv_kvp_daemon.
 POOL="/var/lib/hyperv/.kvp_pool_0"
 KEY_SIZE=512
 VALUE_SIZE=2048
@@ -104,28 +107,38 @@ for i in $(seq 1 30); do
 done
 [ -f "$POOL" ] || exit 0
 
-# Read VMCREATE_SSH_PUBKEY from KVP pool
-index=0
-while true; do
-    offset=$((index * (KEY_SIZE + VALUE_SIZE)))
-    key=$(dd status=none if="$POOL" bs=1 skip="$offset" count="$KEY_SIZE" 2>/dev/null | tr -d '\0')
-    [ -z "$key" ] && break
-    if [ "$key" = "VMCREATE_SSH_PUBKEY" ]; then
-        value_offset=$((offset + KEY_SIZE))
-        pubkey=$(dd status=none if="$POOL" bs=1 skip="$value_offset" count="$VALUE_SIZE" 2>/dev/null | tr -d '\0')
-        if [ -n "$pubkey" ]; then
-            # Install for ubuntu user
-            mkdir -p /home/ubuntu/.ssh
-            echo "$pubkey" > /home/ubuntu/.ssh/authorized_keys
-            chown -R ubuntu:ubuntu /home/ubuntu/.ssh
-            chmod 700 /home/ubuntu/.ssh
-            chmod 600 /home/ubuntu/.ssh/authorized_keys
-            echo "SSH public key injected for ubuntu user"
+# Retry reading the key for up to 60s (host sends it ~12-15s after boot)
+pubkey=""
+for attempt in $(seq 1 60); do
+    index=0
+    while true; do
+        offset=$((index * (KEY_SIZE + VALUE_SIZE)))
+        key=$(dd status=none if="$POOL" bs=1 skip="$offset" count="$KEY_SIZE" 2>/dev/null | tr -d '\0')
+        [ -z "$key" ] && break
+        if [ "$key" = "VMCREATE_SSH_PUBKEY" ]; then
+            value_offset=$((offset + KEY_SIZE))
+            pubkey=$(dd status=none if="$POOL" bs=1 skip="$value_offset" count="$VALUE_SIZE" 2>/dev/null | tr -d '\0')
+            break 2
         fi
-        break
+        index=$((index + 1))
+    done
+    if (( attempt % 10 == 0 )); then
+        echo "inject_ssh_key: waiting for VMCREATE_SSH_PUBKEY... ${attempt}s"
     fi
-    index=$((index + 1))
+    sleep 1
 done
+
+if [ -n "$pubkey" ]; then
+    # Install for ubuntu user (ISO debug access)
+    mkdir -p /home/ubuntu/.ssh
+    echo "$pubkey" > /home/ubuntu/.ssh/authorized_keys
+    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+    echo "SSH public key injected for ubuntu user after ${attempt}s"
+else
+    echo "inject_ssh_key: VMCREATE_SSH_PUBKEY not found after 60s — skipping"
+fi
 KVPKEY
 chmod +x /opt/autorun/inject_ssh_key.sh
 

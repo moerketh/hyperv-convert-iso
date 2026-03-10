@@ -105,7 +105,18 @@ sudo sed -i '/ubiquity/d' image/casper/filesystem.manifest-desktop
 sudo sed -i '/casper/d' image/casper/filesystem.manifest-desktop
 
 # Compress filesystem
-sudo mksquashfs chroot image/casper/filesystem.squashfs -comp xz -b 1M -Xdict-size 100% -noappend -no-duplicates -no-recovery -wildcards -e "var/cache/apt/archives/*" "root/*" "root/.*" "tmp/*" "tmp/.*" "swapfile" "boot/*" "usr/lib/python*" "usr/bin/python*"
+sudo mksquashfs chroot image/casper/filesystem.squashfs -comp xz -b 1M -Xdict-size 100% -noappend -no-duplicates -no-recovery -wildcards -e "var/cache/apt/archives/*" "root/*" "root/.*" "tmp/*" "tmp/.*" "swapfile" "boot/*"
+
+# Verify squashfs integrity — catches corrupt xz blocks before they become
+# unbootable ISOs (block 0x301884 failure in PwnCloudOS_20260310112945).
+echo "Verifying squashfs integrity..."
+if sudo unsquashfs -s image/casper/filesystem.squashfs > /dev/null 2>&1 && \
+   sudo unsquashfs -l image/casper/filesystem.squashfs > /dev/null 2>&1; then
+    echo "Squashfs verification PASSED"
+else
+    echo "ERROR: Squashfs verification FAILED — the image is corrupt. Aborting." >&2
+    exit 1
+fi
 
 # Print filesystem size
 printf $(sudo du -sx --block-size=1 chroot | cut -f1) > image/casper/filesystem.size

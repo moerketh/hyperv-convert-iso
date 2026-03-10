@@ -6,27 +6,62 @@
 FUNCTIONS_SH_LOADED=1
 
 # Function to send KVP (write to custom pool for guest-to-host)
+# Updates the value in-place if the key already exists; appends to the
+# first empty slot otherwise.  The pool is a fixed-size array of 2560-byte
+# records (512 key + 2048 value).  Appending duplicate keys caused the
+# hv_kvp_daemon to report stale values to the host, breaking the
+# PartcloneProgress completion marker detection.
 send_kvp() {
     local key="$1"
     local value="$2"
     local pool="/var/lib/hyperv/.kvp_pool_1"
+    local key_size=512
+    local value_size=2048
+    local record_size=$((key_size + value_size))  # 2560
+
+    # Build the new record in a temp file
     local tmpfile
     tmpfile=$(mktemp) || { echo "Failed to create temp file"; exit 1; }
-
-    # Write null-terminated key and pad to 512 bytes with nulls
     printf "%s\0" "$key" > "$tmpfile"
-    truncate -s 512 "$tmpfile"
-
-    # Append null-terminated value and pad to additional 2048 bytes (total 2560)
+    truncate -s "$key_size" "$tmpfile"
     printf "%s\0" "$value" >> "$tmpfile"
-    truncate -s 2560 "$tmpfile"
+    truncate -s "$record_size" "$tmpfile"
 
-    # Append the fixed-size record to the pool
-    cat "$tmpfile" >> "$pool" || { echo "Failed to write to $pool"; rm "$tmpfile"; exit 1; }
+    # Scan existing records for a matching key to update in-place
+    local index=0
+    local found=0
+    if [ -f "$pool" ]; then
+        local pool_size
+        pool_size=$(stat -c%s "$pool" 2>/dev/null || echo 0)
+        while [ $((index * record_size)) -lt "$pool_size" ]; do
+            local offset=$((index * record_size))
+            local existing_key
+            existing_key=$(dd status=none if="$pool" bs=1 skip="$offset" count="$key_size" 2>/dev/null | tr -d '\0')
+
+            if [ -z "$existing_key" ]; then
+                # Empty slot — write here
+                dd status=none if="$tmpfile" of="$pool" bs=1 seek="$offset" count="$record_size" conv=notrunc 2>/dev/null
+                found=1
+                break
+            fi
+
+            if [ "$existing_key" = "$key" ]; then
+                # Matching key — overwrite the record in-place
+                dd status=none if="$tmpfile" of="$pool" bs=1 seek="$offset" count="$record_size" conv=notrunc 2>/dev/null
+                found=1
+                break
+            fi
+
+            index=$((index + 1))
+        done
+    fi
+
+    # If no existing slot found, append (new pool or all slots occupied by other keys)
+    if [ "$found" -eq 0 ]; then
+        cat "$tmpfile" >> "$pool" || { echo "Failed to write to $pool"; rm "$tmpfile"; exit 1; }
+    fi
+
     rm "$tmpfile"
-
-    # Optional: Restart daemon to flush immediately (may not be needed in loop)
-    # systemctl restart hv-kvp-daemon
 }
 
 # Logging function with severity levels
@@ -560,6 +595,13 @@ update_fstab() {
             else
                 echo "/boot/efi already in fstab; no addition needed."
             fi
+        fi
+
+        # Comment out swap entries — the new GPT disk has no swap partition,
+        # so stale swap UUIDs would cause a ~90s boot delay.
+        if grep -qE '^[^#].*\bswap\b' "$fstab_path"; then
+            echo "Commenting out swap entries in fstab (no swap on new disk)."
+            sed -i '/\bswap\b/s/^/#/' "$fstab_path"
         fi
 
         if [ -n "$boot_part" ]; then

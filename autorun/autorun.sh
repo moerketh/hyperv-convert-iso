@@ -214,6 +214,31 @@ report_progress "INSTALL_GRUB" "Installing GRUB bootloader"
 chroot /mnt/new /bin/bash /opt/autorun/install_grub.sh "$new_disk"
 rm /mnt/new/opt/autorun/install_grub.sh
 
+# ── Disable stale resume (hibernate) device ──────────────────────────
+# The old MBR disk may have had a swap partition configured as the resume
+# device. The new GPT disk has no swap, so the stale UUID causes a ~90s
+# boot delay ("Gave up waiting for suspend/resume device").
+echo "Disabling stale resume device references..."
+if [ -f /mnt/new/etc/initramfs-tools/conf.d/resume ]; then
+    echo "RESUME=none" > /mnt/new/etc/initramfs-tools/conf.d/resume
+    echo "Cleared /etc/initramfs-tools/conf.d/resume"
+fi
+# Also strip resume= from GRUB command line defaults
+if [ -f /mnt/new/etc/default/grub ]; then
+    sed -i 's/resume=UUID=[^ ]*/noresume/g; s/resume=\/dev\/[^ ]*/noresume/g' /mnt/new/etc/default/grub
+fi
+# Regenerate initramfs so the resume hook picks up the change
+if chroot /mnt/new /bin/bash -c 'command -v update-initramfs >/dev/null 2>&1'; then
+    echo "Regenerating initramfs..."
+    chroot /mnt/new update-initramfs -u -k all 2>&1 || echo "WARNING: update-initramfs failed (non-fatal)"
+elif chroot /mnt/new /bin/bash -c 'command -v dracut >/dev/null 2>&1'; then
+    echo "Regenerating initramfs (dracut)..."
+    chroot /mnt/new dracut --force 2>&1 || echo "WARNING: dracut failed (non-fatal)"
+elif chroot /mnt/new /bin/bash -c 'command -v mkinitcpio >/dev/null 2>&1'; then
+    echo "Regenerating initramfs (mkinitcpio)..."
+    chroot /mnt/new mkinitcpio -P 2>&1 || echo "WARNING: mkinitcpio failed (non-fatal)"
+fi
+
 # ── Hyper-V guest optimization ───────────────────────────────────────
 # Install daemons that make the guest a first-class Hyper-V citizen.
 # Non-fatal: if the distro can't install these, the VM still works.

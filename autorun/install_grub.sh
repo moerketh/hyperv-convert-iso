@@ -27,23 +27,23 @@ if is_arch; then
   echo 'Pacman install grub'
   pacman -S --noconfirm grub efibootmgr os-prober
   export PATH=$PATH:/usr/sbin:/sbin
-  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB "$new_disk"
+  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   grub-mkconfig -o /boot/grub/grub.cfg
 elif is_debian; then
   apt-get update --allow-releaseinfo-change -y || apt-get update -y
   apt-get install -y grub-efi-amd64 efibootmgr os-prober
   export PATH=$PATH:/usr/sbin:/sbin
-  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB "$new_disk"
+  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   update-grub
 elif is_fedora; then
   dnf install -y grub2-efi-x64 grub2-efi-x64-modules efibootmgr shim-x64
   export PATH=$PATH:/usr/sbin:/sbin
-  grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB "$new_disk"
+  grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   grub2-mkconfig -o /boot/grub2/grub.cfg
 elif is_suse; then
   zypper install -y grub2-x86_64-efi efibootmgr shim
   export PATH=$PATH:/usr/sbin:/sbin
-  grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB "$new_disk"
+  grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   grub2-mkconfig -o /boot/grub2/grub.cfg
 else
   echo "Unknown distribution: $ID (ID_LIKE: ${ID_LIKE:-none})"
