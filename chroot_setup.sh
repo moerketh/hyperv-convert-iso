@@ -5,9 +5,9 @@ export HOME=/root
 echo "autorun" > /etc/hostname
 
 cat << EOT > /etc/apt/sources.list
-deb http://us.archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
-deb http://us.archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
-deb http://us.archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
 EOT
 
 apt-get update -y

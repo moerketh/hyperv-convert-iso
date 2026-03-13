@@ -49,3 +49,41 @@ else
   echo "Unknown distribution: $ID (ID_LIKE: ${ID_LIKE:-none})"
   exit 1
 fi
+
+# ── Determine GRUB directory ─────────────────────────────────────────
+if [ -d /boot/grub2 ]; then
+    grub_dir="/boot/grub2"
+else
+    grub_dir="/boot/grub"
+fi
+
+# ── Verify grub.cfg was generated on root partition ──────────────────
+echo "--- GRUB verification ---"
+if [ ! -f "$grub_dir/grub.cfg" ]; then
+    echo "WARNING: $grub_dir/grub.cfg not found after grub install!"
+elif ! grep -q 'menuentry\|linux' "$grub_dir/grub.cfg" 2>/dev/null; then
+    echo "WARNING: $grub_dir/grub.cfg exists but has no boot entries"
+else
+    echo "OK: $grub_dir/grub.cfg has boot entries"
+fi
+
+# ── Verify EFI binary was installed ──────────────────────────────────
+efi_binary=""
+for candidate in /boot/efi/EFI/BOOT/BOOTX64.EFI /boot/efi/EFI/BOOT/bootx64.efi \
+                 /boot/efi/EFI/BOOT/grubx64.efi /boot/efi/EFI/GRUB/grubx64.efi; do
+    if [ -f "$candidate" ]; then
+        efi_binary="$candidate"
+        break
+    fi
+done
+if [ -n "$efi_binary" ]; then
+    echo "OK: EFI binary found at $efi_binary"
+else
+    echo "ERROR: No EFI binary found on ESP after grub-install!"
+    ls -laR /boot/efi/ 2>&1 || true
+    exit 1
+fi
+
+echo "--- ESP contents after grub-install ---"
+find /boot/efi -type f 2>&1 || true
+echo "---"

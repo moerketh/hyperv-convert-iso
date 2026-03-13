@@ -624,3 +624,239 @@ UUID=$new_esp_uuid /boot/efi vfat defaults 0 2
 EOF
     fi
 }
+
+# ── DNS resolution for chroot ────────────────────────────────────────
+# Many distros (Arch, Fedora, NixOS) use a symlink for /etc/resolv.conf
+# that points into /run/systemd/resolve/ which doesn't exist inside
+# the ISO.  A bind-mount over a dangling symlink fails silently,
+# leaving the chroot without DNS.  This function removes the symlink
+# (if any), then writes the live ISO's resolv.conf into the target.
+setup_chroot_dns() {
+    local target="$1/etc/resolv.conf"
+    # Remove dangling symlink so we can write a real file
+    if [ -L "$target" ]; then
+        rm -f "$target"
+        echo "Removed dangling resolv.conf symlink in chroot"
+    fi
+    # Copy the running ISO's resolv.conf (which has working DNS)
+    if [ -f /etc/resolv.conf ] && [ -s /etc/resolv.conf ]; then
+        cp -L /etc/resolv.conf "$target"
+    else
+        # Fallback: write a basic DNS config
+        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$target"
+    fi
+    echo "Configured DNS in chroot: $(cat "$target")"
+}
+
+# ── Create the vmcreate automation user (distro-agnostic) ────────────
+# Works on Debian/Ubuntu (adduser), Arch (useradd), Fedora/RHEL (useradd)
+# and detects the correct admin group (sudo vs wheel).
+create_automation_user() {
+    local root="$1"       # chroot root, e.g. /mnt/new
+    local ssh_pubkey="$2"  # SSH public key string
+
+    chroot "$root" /bin/bash -c '
+        # Ensure sudo is available (Arch minimal may not ship it)
+        if ! command -v sudo >/dev/null 2>&1; then
+            if command -v pacman >/dev/null 2>&1; then
+                pacman -S --noconfirm sudo 2>&1 || true
+            fi
+        fi
+
+        # Create vmcreate user if it does not exist
+        if ! id vmcreate >/dev/null 2>&1; then
+            if command -v adduser >/dev/null 2>&1 && adduser --help 2>&1 | grep -q "\-\-gecos"; then
+                # Debian/Ubuntu style
+                adduser --disabled-password --gecos "VMCreate Automation" vmcreate
+            else
+                # Arch/Fedora/RHEL style
+                useradd -m -c "VMCreate Automation" -s /bin/bash vmcreate
+            fi
+        fi
+
+        # Detect admin group: Debian=sudo, Arch/Fedora=wheel
+        if getent group sudo >/dev/null 2>&1; then
+            usermod -aG sudo vmcreate
+        elif getent group wheel >/dev/null 2>&1; then
+            usermod -aG wheel vmcreate
+        fi
+
+        mkdir -p /etc/sudoers.d
+        echo "vmcreate ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/vmcreate
+        chmod 0440 /etc/sudoers.d/vmcreate
+
+        # Install SSH public key
+        mkdir -p /home/vmcreate/.ssh
+        echo "'"$ssh_pubkey"'" > /home/vmcreate/.ssh/authorized_keys
+        chown -R vmcreate:vmcreate /home/vmcreate/.ssh
+        chmod 700 /home/vmcreate/.ssh
+        chmod 600 /home/vmcreate/.ssh/authorized_keys
+
+        # Ensure pubkey auth is enabled
+        sed -i "s/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
+    ' || echo "WARNING: Automation user setup failed (non-fatal)" | tee -a /tmp/error.log
+}
+
+# ── Hyper-V integration shared helpers ───────────────────────────────
+# These functions are called by both autorun.sh and customize_only.sh
+# to avoid duplicating integration logic in two places.
+
+# Capture SSH state before any chroot apt calls that might enable SSH.
+# Creates a marker file that the post-boot DisableSshStep reads.
+# Usage: capture_ssh_state /mnt/new
+capture_ssh_state() {
+    local root="$1"
+    local _wants="$root/etc/systemd/system/multi-user.target.wants"
+    mkdir -p "$_wants"
+    local _ssh_already_enabled=false
+    for _svc in ssh sshd; do
+        if [ -L "$_wants/${_svc}.service" ]; then
+            _ssh_already_enabled=true
+            break
+        fi
+    done
+    if [ "$_ssh_already_enabled" = "false" ]; then
+        mkdir -p "$root/var/lib/vmcreate"
+        touch "$root/var/lib/vmcreate/.ssh_was_disabled"
+        echo "SSH was not enabled — marked for post-boot restore"
+    fi
+}
+
+# Remove conflicting apt sources that prevent apt-get update from working.
+# E.g. REMnux ships both .list and .sources for Microsoft repos with
+# different Signed-By values.
+# Usage: fix_apt_repo_conflicts /mnt/new
+fix_apt_repo_conflicts() {
+    local root="$1"
+    if [ -f "$root/etc/apt/sources.list.d/microsoft-prod.list" ] && \
+       [ -f "$root/etc/apt/sources.list.d/microsoft.sources" ]; then
+        rm -f "$root/etc/apt/sources.list.d/microsoft-prod.list"
+        echo "Removed duplicate Microsoft repo file to fix apt conflict"
+    fi
+}
+
+# Install Hyper-V guest integration packages.
+# Package names differ across distros: Ubuntu uses linux-cloud-tools-*,
+# Fedora/RHEL uses hyperv-daemons, Arch uses hyperv.
+# Usage: install_hyperv_packages /mnt/new
+install_hyperv_packages() {
+    local root="$1"
+    local _kver
+    _kver=$(ls "$root/lib/modules/" 2>/dev/null | sort -V | tail -1)
+
+    report_progress "HYPERV_OPTIMIZE" "Installing Hyper-V guest integration services"
+    echo "Installing Hyper-V guest optimizations..."
+
+    if chroot "$root" /bin/bash -c "
+        export DEBIAN_FRONTEND=noninteractive
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y -qq
+            KVER=\"${_kver}\"
+            apt-get install -y -qq linux-cloud-tools-common openssh-server 2>&1
+            if [ -n \"\$KVER\" ]; then
+                apt-get install -y -qq \"linux-cloud-tools-\${KVER}\" 2>&1 || true
+            fi
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y -q hyperv-daemons openssh-server 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y -q hyperv-daemons openssh-server 2>&1
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman-key --init 2>&1 && pacman-key --populate archlinux 2>&1 || true
+            pacman -Sy --noconfirm hyperv openssh sudo 2>&1
+        else
+            echo 'Unknown package manager — skipping Hyper-V optimization'
+            exit 1
+        fi
+        # Try enabling services in chroot (unreliable but harmless)
+        for svc in hv-kvp-daemon hv_kvp_daemon hv-vss-daemon hv_vss_daemon hv-fcopy-daemon hv_fcopy_daemon; do
+            systemctl enable \"\${svc}.service\" 2>/dev/null || true
+        done
+        systemctl enable ssh.service 2>/dev/null || systemctl enable sshd.service 2>/dev/null || true
+    "; then
+        echo "Hyper-V guest optimization completed successfully"
+    else
+        report_progress "HYPERV_OPTIMIZE_WARNING" "Hyper-V optimization partially failed (non-fatal)"
+        echo "WARNING: Some Hyper-V optimizations could not be installed (non-fatal)" | tee -a /tmp/error.log
+    fi
+}
+
+# Enable critical services via direct symlinks from the host side.
+# systemctl enable is unreliable in chroot (policy-rc.d, presets, missing D-Bus).
+# Both hyphenated (Ubuntu) and underscored (Fedora/Arch) service names are tried.
+# Usage: enable_services_via_symlinks /mnt/new
+enable_services_via_symlinks() {
+    local root="$1"
+    local _wants="$root/etc/systemd/system/multi-user.target.wants"
+    mkdir -p "$_wants"
+    for _svc in ssh sshd hv-kvp-daemon hv_kvp_daemon hv-vss-daemon hv_vss_daemon hv-fcopy-daemon hv_fcopy_daemon; do
+        for _prefix in /usr/lib/systemd/system /lib/systemd/system; do
+            if [ -f "$root${_prefix}/${_svc}.service" ]; then
+                ln -sf "${_prefix}/${_svc}.service" "$_wants/${_svc}.service"
+                echo "Enabled ${_svc}.service via direct symlink"
+                break
+            fi
+        done
+        # Unmask if the distro ships it masked (symlink to /dev/null)
+        local _mask="$root/etc/systemd/system/${_svc}.service"
+        if [ -L "$_mask" ] && [ "$(readlink "$_mask")" = "/dev/null" ]; then
+            rm -f "$_mask"
+            echo "Unmasked ${_svc}.service"
+        fi
+    done
+}
+
+# Generate SSH host keys if none exist (distros with SSH disabled often
+# ship without them, causing connection failures).
+# Usage: generate_ssh_host_keys /mnt/new
+generate_ssh_host_keys() {
+    local root="$1"
+    if ! ls "$root/etc/ssh/ssh_host_"*"_key" >/dev/null 2>&1; then
+        echo "No SSH host keys found — generating"
+        chroot "$root" ssh-keygen -A
+    fi
+}
+
+# Replace hardcoded interface names in netplan configs with a Hyper-V
+# match-all pattern so DHCP works regardless of hypervisor.
+# VirtualBox uses ens33/enp0s3, Hyper-V uses eth0.
+# Usage: fix_netplan_for_hyperv /mnt/new
+fix_netplan_for_hyperv() {
+    local root="$1"
+    if ls "$root/etc/netplan/"*.yaml >/dev/null 2>&1; then
+        for _np in "$root/etc/netplan/"*.yaml; do
+            if grep -qE '^\s+(ens[0-9]|enp[0-9]|enx[0-9a-f]|eth[0-9])[a-z0-9]*:' "$_np"; then
+                local _renderer=""
+                if grep -q 'renderer:' "$_np"; then
+                    _renderer=$(grep 'renderer:' "$_np" | head -1 | sed 's/.*renderer:\s*//')
+                fi
+                echo "Replacing hardcoded interface in $_np with match-all DHCP config"
+                cat > "$_np" <<'NETPLAN'
+network:
+  version: 2
+  ethernets:
+    all-en:
+      match:
+        driver: hv_netvsc
+      dhcp4: true
+      dhcp6: true
+NETPLAN
+                if [ -n "$_renderer" ]; then
+                    sed -i "s/^  ethernets:/  renderer: $_renderer\n  ethernets:/" "$_np"
+                fi
+            fi
+        done
+    fi
+}
+
+# Disable cloud-init network config override if cloud-init is installed.
+# Without this, cloud-init may regenerate the old netplan on first boot,
+# undoing the fix_netplan_for_hyperv changes.
+# Usage: disable_cloud_init_network /mnt/new
+disable_cloud_init_network() {
+    local root="$1"
+    if [ -d "$root/etc/cloud" ]; then
+        mkdir -p "$root/etc/cloud/cloud.cfg.d"
+        echo "network: {config: disabled}" > "$root/etc/cloud/cloud.cfg.d/99-disable-network.cfg"
+        echo "Disabled cloud-init network config override"
+    fi
+}

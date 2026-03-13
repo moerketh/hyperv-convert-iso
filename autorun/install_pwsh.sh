@@ -34,10 +34,15 @@ if is_debian; then
         VERSION_FOR_REPO="24.04"
     fi
 
-    wget -q "https://packages.microsoft.com/config/ubuntu/${VERSION_FOR_REPO}/packages-microsoft-prod.deb" -O /tmp/packages-microsoft-prod.deb 2>&1 || \
-        wget -q "https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb" -O /tmp/packages-microsoft-prod.deb 2>&1
-    dpkg -i /tmp/packages-microsoft-prod.deb
-    rm -f /tmp/packages-microsoft-prod.deb
+    # Skip if a Microsoft repo is already configured (e.g. REMnux ships microsoft.sources)
+    if ls /etc/apt/sources.list.d/microsoft*.sources /etc/apt/sources.list.d/microsoft*.list 2>/dev/null | grep -q .; then
+        echo "Microsoft repo already configured — skipping packages-microsoft-prod.deb"
+    else
+        wget -q "https://packages.microsoft.com/config/ubuntu/${VERSION_FOR_REPO}/packages-microsoft-prod.deb" -O /tmp/packages-microsoft-prod.deb 2>&1 || \
+            wget -q "https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb" -O /tmp/packages-microsoft-prod.deb 2>&1
+        dpkg -i /tmp/packages-microsoft-prod.deb
+        rm -f /tmp/packages-microsoft-prod.deb
+    fi
     apt-get update -y -qq
     apt-get install -y -qq powershell 2>&1
 

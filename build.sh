@@ -39,12 +39,50 @@ if [ -d "$WORK_DIR/chroot" ]; then
     sudo rm -rf "$WORK_DIR/chroot"
 fi
 
+# ── Ensure DNS works (WSL often has a broken resolv.conf) ────────────
+if ! getent hosts archive.ubuntu.com > /dev/null 2>&1; then
+    echo "DNS resolution failed — fixing /etc/resolv.conf..."
+    sudo rm -f /etc/resolv.conf
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf > /dev/null
+    if ! getent hosts archive.ubuntu.com > /dev/null 2>&1; then
+        echo "ERROR: DNS still broken after fix. Check your network connection." >&2
+        exit 1
+    fi
+    echo "DNS resolution restored."
+fi
+
 # Install dependencies
 sudo apt-get update
 sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-amd64-signed shim-signed syslinux syslinux-common mtools dosfstools isolinux genisoimage
 
-# Bootstrap minimal Ubuntu
-sudo debootstrap --arch=amd64 --variant=minbase "$UBUNTU_VERSION" chroot "http://us.archive.ubuntu.com/ubuntu/"
+# Bootstrap minimal Ubuntu — try multiple mirrors in case one is unreachable
+UBUNTU_MIRRORS=(
+    "http://archive.ubuntu.com/ubuntu/"
+    "http://us.archive.ubuntu.com/ubuntu/"
+    "http://eu.archive.ubuntu.com/ubuntu/"
+    "http://de.archive.ubuntu.com/ubuntu/"
+    "http://nl.archive.ubuntu.com/ubuntu/"
+    "http://se.archive.ubuntu.com/ubuntu/"
+    "http://mirrors.kernel.org/ubuntu/"
+)
+
+DEBOOTSTRAP_OK=false
+for mirror in "${UBUNTU_MIRRORS[@]}"; do
+    echo "Trying debootstrap with mirror: $mirror"
+    if sudo debootstrap --arch=amd64 --variant=minbase "$UBUNTU_VERSION" chroot "$mirror"; then
+        DEBOOTSTRAP_MIRROR="$mirror"
+        DEBOOTSTRAP_OK=true
+        break
+    fi
+    echo "Mirror $mirror failed, trying next..."
+    sudo rm -rf chroot
+done
+
+if [ "$DEBOOTSTRAP_OK" != true ]; then
+    echo "ERROR: All Ubuntu mirrors failed. Check your network connection." >&2
+    exit 1
+fi
+echo "debootstrap succeeded with mirror: $DEBOOTSTRAP_MIRROR"
 
 # Copy autorun script and lib to chroot
 source_dir="./autorun"
@@ -72,6 +110,11 @@ sudo mount --bind /run chroot/run
 sudo chroot chroot mount -t proc none /proc
 sudo chroot chroot mount -t sysfs none /sys
 sudo chroot chroot mount -t devpts none /dev/pts
+
+# Ensure DNS works inside the chroot (resolv.conf is often a dangling
+# symlink to systemd-resolved which isn't running in the chroot)
+sudo rm -f chroot/etc/resolv.conf
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee chroot/etc/resolv.conf > /dev/null
 
 # Setup autorun script
 sudo cp ./chroot_setup.sh chroot/tmp/chroot_setup.sh 
@@ -162,7 +205,9 @@ grub-mkstandalone \
 cat /usr/lib/grub/i386-pc/cdboot.img isolinux/core.img > isolinux/bios.img
 
 # Generate md5sum.txt
-sudo /bin/bash -c "(find . -type f -print0 | xargs -0 md5sum | grep -v -e 'isolinux' > md5sum.txt)"
+# Remove any stale md5sum.txt first so it doesn't checksum itself
+sudo rm -f md5sum.txt
+sudo /bin/bash -c "(find . -type f -print0 | xargs -0 md5sum | grep -v -e 'isolinux' -e 'md5sum.txt' > md5sum.txt)"
 
 # Create ISO
 sudo xorriso \

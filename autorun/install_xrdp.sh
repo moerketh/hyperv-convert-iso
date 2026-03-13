@@ -11,11 +11,59 @@ is_fedora() { [ "$ID" = "fedora" ] || [[ "${ID_LIKE:-}" =~ fedora ]]; }
 is_suse() { [ "$ID" = "opensuse-tumbleweed" ] || [ "$ID" = "opensuse-leap" ] || [[ "${ID_LIKE:-}" =~ suse ]]; }
 
 ###############################################################################
+# Skip if no X11/Xorg display server is installed (e.g. server/minimal images)
+###############################################################################
+if ! command -v Xorg >/dev/null 2>&1 && ! command -v startx >/dev/null 2>&1; then
+  echo "XRDP_SKIPPED: No X11/Xorg display server found — xRDP requires a graphical session. Skipping."
+  exit 0
+fi
+
+###############################################################################
 # Install xRDP
 ###############################################################################
 if is_arch; then
+  # xrdp is not in the official Arch repos — build from source
   pacman -Syy --noconfirm
-  pacman -S --noconfirm xrdp
+  pacman -S --noconfirm base-devel nasm xorg-server openssl pam libxrandr libxfixes
+  _xrdp_build=$(mktemp -d)
+  git clone --depth 1 https://github.com/neutrinolabs/xrdp.git "$_xrdp_build/xrdp"
+  cd "$_xrdp_build/xrdp"
+  ./bootstrap
+  ./configure --enable-vsock
+  make -j"$(nproc)"
+  make install
+  cd /
+  rm -rf "$_xrdp_build"
+  # Create the systemd units that the source build doesn't install
+  cat > /etc/systemd/system/xrdp.service << 'XRDPUNIT'
+[Unit]
+Description=xrdp daemon
+After=network.target xrdp-sesman.service
+Requires=xrdp-sesman.service
+
+[Service]
+Type=forking
+PIDFile=/var/run/xrdp/xrdp.pid
+ExecStart=/usr/local/sbin/xrdp
+ExecStop=/usr/local/sbin/xrdp --kill
+
+[Install]
+WantedBy=multi-user.target
+XRDPUNIT
+  cat > /etc/systemd/system/xrdp-sesman.service << 'SESUNIT'
+[Unit]
+Description=xrdp session manager
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/xrdp/xrdp-sesman.pid
+ExecStart=/usr/local/sbin/xrdp-sesman
+ExecStop=/usr/local/sbin/xrdp-sesman --kill
+
+[Install]
+WantedBy=multi-user.target
+SESUNIT
 elif is_debian; then
   apt-get update -y
   apt-get install -y xrdp
@@ -29,8 +77,17 @@ else
   exit 1
 fi
 
-INI=/etc/xrdp/xrdp.ini
-SESMAN=/etc/xrdp/sesman.ini
+# Config paths differ between package installs (/etc/xrdp/) and source builds (/usr/local/etc/xrdp/)
+if [ -f /etc/xrdp/xrdp.ini ]; then
+  INI=/etc/xrdp/xrdp.ini
+  SESMAN=/etc/xrdp/sesman.ini
+elif [ -f /usr/local/etc/xrdp/xrdp.ini ]; then
+  INI=/usr/local/etc/xrdp/xrdp.ini
+  SESMAN=/usr/local/etc/xrdp/sesman.ini
+else
+  echo "ERROR: xrdp.ini not found — xRDP installation may have failed"
+  exit 1
+fi
 
 ###############################################################################
 # Transport: vsock for Hyper-V Enhanced Session Mode
@@ -49,6 +106,14 @@ sed -i '/^\[Globals\]/,/^\[/{s/^autorun=.*/autorun=Xorg/}' "$INI"
 # Login screen title — use distro pretty name
 ###############################################################################
 sed -i '/^#*ls_title=/c\ls_title='"${PRETTY_NAME}" "$INI"
+
+###############################################################################
+# Pre-fill login username (passed via XRDP_USERNAME env var from KVP)
+###############################################################################
+if [ -n "${XRDP_USERNAME:-}" ]; then
+    sed -i '/^#*ls_username=/c\ls_username='"${XRDP_USERNAME}" "$INI"
+    echo "xRDP: pre-filled login username to '${XRDP_USERNAME}'"
+fi
 
 ###############################################################################
 # Login screen colours — clean light dialog on dark outer background
@@ -164,7 +229,8 @@ sed -i '/^\[Xvnc\]/,$d' "$INI"
 ###############################################################################
 # Session startup — auto-detect desktop environment, proper D-Bus
 ###############################################################################
-cat > /etc/xrdp/startwm.sh << 'STARTWM'
+XRDP_CONFDIR=$(dirname "$INI")
+cat > "$XRDP_CONFDIR/startwm.sh" << 'STARTWM'
 #!/bin/sh
 # xrdp session — auto-detect desktop environment
 
@@ -227,7 +293,7 @@ fi
 test -x /etc/X11/Xsession && exec /etc/X11/Xsession
 exec /bin/sh /etc/X11/Xsession
 STARTWM
-chmod +x /etc/xrdp/startwm.sh
+chmod +x "$XRDP_CONFDIR/startwm.sh"
 
 ###############################################################################
 # Enable services (start deferred to next boot)

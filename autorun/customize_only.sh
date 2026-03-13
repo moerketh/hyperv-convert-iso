@@ -166,60 +166,43 @@ mount --bind /sys /mnt/new/sys
 mount --bind /dev/pts /mnt/new/dev/pts
 modprobe efivarfs
 mount --bind /sys/firmware/efi/efivars /mnt/new/sys/firmware/efi/efivars || true
-mount --bind /etc/resolv.conf /mnt/new/etc/resolv.conf || cp -L /etc/resolv.conf /mnt/new/etc/resolv.conf
+setup_chroot_dns /mnt/new
 
 # Copy autorun files for chroot scripts
 mkdir -p /mnt/new/opt/autorun
 cp /opt/autorun/install_xrdp.sh /mnt/new/opt/autorun/ 2>/dev/null || true
 cp /opt/autorun/install_pwsh.sh /mnt/new/opt/autorun/ 2>/dev/null || true
 
+# ── Capture SSH state BEFORE any chroot apt calls ────────────────────
+capture_ssh_state /mnt/new
+
+# ── Fix conflicting apt sources ──────────────────────────────────────
+fix_apt_repo_conflicts /mnt/new
+
 # ── Hyper-V guest optimization ───────────────────────────────────────
-# Install daemons that make the guest a first-class Hyper-V citizen:
-#   - hv_kvp_daemon:   Key-Value Pair exchange (host↔guest signaling)
-#   - hv_vss_daemon:   VSS snapshots / live checkpoints
-#   - hv_fcopy_daemon: Host-to-guest file copy service
-#   - openssh-server:  Enables PowerShell Direct (SSH over VMBus/hv_sock)
-#
-# These are safe additions — they don't replace the kernel or modify
-# distro-specific configurations, just add integration daemons.
-# Non-fatal: if the distro can't install these, the VM still works.
-report_progress "HYPERV_OPTIMIZE" "Installing Hyper-V guest integration services"
-echo "Installing Hyper-V guest optimizations..."
-if chroot /mnt/new /bin/bash -c '
-    export DEBIAN_FRONTEND=noninteractive
-    # Try apt (Debian/Ubuntu/Parrot/Kali) then dnf/yum (Fedora/RHEL)
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y -qq
-        apt-get install -y -qq hyperv-daemons openssh-server 2>&1
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q hyperv-daemons openssh-server 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y -q hyperv-daemons openssh-server 2>&1
-    elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm hyperv openssh 2>&1
-    else
-        echo "Unknown package manager — skipping Hyper-V optimization"
-        exit 1
-    fi
-    # Enable services so they start on next boot
-    systemctl enable hv_kvp_daemon.service 2>/dev/null || true
-    systemctl enable hv_vss_daemon.service 2>/dev/null || true
-    systemctl enable hv_fcopy_daemon.service 2>/dev/null || true
-    systemctl enable ssh.service 2>/dev/null || systemctl enable sshd.service 2>/dev/null || true
-'; then
-    echo "Hyper-V guest optimization completed successfully"
-else
-    report_progress "HYPERV_OPTIMIZE_WARNING" "Hyper-V optimization partially failed (non-fatal)"
-    echo "WARNING: Some Hyper-V optimizations could not be installed (non-fatal)" | tee -a /tmp/error.log
-fi
+install_hyperv_packages /mnt/new
+
+# ── Ensure critical services are enabled via direct symlinks ──────────
+enable_services_via_symlinks /mnt/new
+
+# Generate SSH host keys if missing
+generate_ssh_host_keys /mnt/new
+
+# ── Fix netplan: replace hardcoded interface names with match-all ─────
+fix_netplan_for_hyperv /mnt/new
+
+# ── Disable cloud-init network override ──────────────────────────────
+disable_cloud_init_network /mnt/new
 
 # Read KVP flags
 XRDP_FLAG=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_XRDP")
 if [ "$XRDP_FLAG" = "true" ]; then
     report_progress "INSTALL_XRDP" "Installing XRDP for Enhanced Session support"
     echo "Installing xrdp for Hyper-V Enhanced Session support"
+    XRDP_USERNAME=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_XRDP_USERNAME")
+    export XRDP_USERNAME
     # Non-fatal: a failed XRDP install should not invalidate a successful customization
-    if chroot /mnt/new /bin/bash /opt/autorun/install_xrdp.sh; then
+    if chroot /mnt/new /bin/bash -c "XRDP_USERNAME='$XRDP_USERNAME' /opt/autorun/install_xrdp.sh"; then
         echo "XRDP installation completed successfully"
     else
         report_progress "XRDP_WARNING" "XRDP installation failed, VM will boot without XRDP"
@@ -256,26 +239,17 @@ for i in $(seq 1 30); do
 done
 if [ -n "$SSH_PUBKEY" ]; then
     echo "Injecting SSH key and creating vmcreate automation user on target VM"
-    chroot /mnt/new /bin/bash -c "
-        # Create vmcreate user if it doesn't exist
-        if ! id vmcreate >/dev/null 2>&1; then
-            adduser --disabled-password --gecos 'VMCreate Automation' vmcreate
-            usermod -aG sudo vmcreate
-            echo 'vmcreate ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/vmcreate
-            chmod 0440 /etc/sudoers.d/vmcreate
-        fi
-        # Install SSH public key
-        mkdir -p /home/vmcreate/.ssh
-        echo \"$SSH_PUBKEY\" > /home/vmcreate/.ssh/authorized_keys
-        chown -R vmcreate:vmcreate /home/vmcreate/.ssh
-        chmod 700 /home/vmcreate/.ssh
-        chmod 600 /home/vmcreate/.ssh/authorized_keys
-        # Ensure pubkey auth is enabled
-        sed -i 's/^#\\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-    " || echo "WARNING: SSH key injection failed (non-fatal)" | tee -a /tmp/error.log
+    create_automation_user /mnt/new "$SSH_PUBKEY"
 else
     echo "No SSH public key in KVP — skipping automation user setup"
 fi
+
+# Save autorun journal to the target disk so the host can collect it
+# after the VM reboots from the hard drive.
+# Filter to autorun.service only — the full journal includes thousands of
+# lines of kernel, systemd and sbkeysync noise that obscure the actual output.
+journalctl -u autorun.service --no-pager > /mnt/new/var/log/vmcreate-autorun.log 2>&1 || true
+echo "Saved autorun journal to /mnt/new/var/log/vmcreate-autorun.log"
 
 report_progress "CLEANUP" "Customization completed successfully"
 echo "Customize-only mode completed"
