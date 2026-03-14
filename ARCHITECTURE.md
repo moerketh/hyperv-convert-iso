@@ -6,7 +6,7 @@ The hyperv-convert-iso is a bootable Ubuntu-based live environment that automati
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Hyper-V Host Environment                    │
+│                    Hyper-V Host Environment                     │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
 │  │ VMCreate    │    │ KVP Service │    │ Hyper-V VM          │  │
 │  │ GUI         │◄──►│ Data        │◄──►│ ┌─────────────────┐ │  │
@@ -15,14 +15,14 @@ The hyperv-convert-iso is a bootable Ubuntu-based live environment that automati
 │  │             │    │             │    │ │ (Live Ubuntu)   │ │  │
 │  │             │    │             │    │ └─────────────────┘ │  │
 │  └─────────────┘    └─────────────┘    │ ┌─────────────────┐ │  │
-│                                       │ │ Source Disk    │ │  │
-│                                       │ │ (Linux)        │ │  │
-│                                       │ └─────────────────┘ │  │
-│                                       │ ┌─────────────────┐ │  │
-│                                       │ │ Target Disk    │ │  │
-│                                       │ │ (Empty)        │ │  │
-│                                       │ └─────────────────┘ │  │
-│                                       └─────────────────────┘  │
+│                                        │ │ Source Disk     │ │  │
+│                                        │ │ (Linux)         │ │  │
+│                                        │ └─────────────────┘ │  │
+│                                        │ ┌─────────────────┐ │  │
+│                                        │ │ Target Disk     │ │  │
+│                                        │ │ (Empty)         │ │  │
+│                                        │ └─────────────────┘ │  │
+│                                        └─────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -51,6 +51,8 @@ The system follows a deterministic boot sequence from ISO initialization to clea
 5. Main Conversion Workflow (autorun.sh)
    ├─ Source functions.sh library
    ├─ Set cleanup trap (mounts, autorun-done flag)
+   ├─ Wait for KVP configuration from host (30s)
+   ├─ Route: VMCREATE_MODE=customize → customize_only.sh
    ├─ Detect disks (empty target, partitioned source)
    ├─ Pre-flight validation
    ├─ Partition target disk (GPT layout)
@@ -59,8 +61,13 @@ The system follows a deterministic boot sequence from ISO initialization to clea
    ├─ Mount new system
    ├─ Update fstab (UUID replacement)
    ├─ Install GRUB bootloader
-   ├─ Install XRDP (optional)
+   ├─ Install Hyper-V guest daemons
+   ├─ Install xRDP (optional, via KVP flag)
+   ├─ Install PowerShell (for post-boot config)
+   ├─ Create automation user + inject SSH key
+   ├─ Write ESP redirect grub.cfg
    ├─ Cleanup VirtualBox additions
+   ├─ Remove autorun scripts from target
    └─ Exit with status 0
    ↓
 6. Systemd Completion
@@ -74,45 +81,55 @@ The system follows a deterministic boot sequence from ISO initialization to clea
 
 ### Core Scripts
 
-#### script.sh (ISO Builder)
+#### build.sh (ISO Builder)
 - **Purpose**: Creates bootable ISO from Ubuntu minimal base
-- **Size**: 179 lines
 - **Key Operations**:
-  - Bootstrap Ubuntu 24.04 LTS chroot with debootstrap
+  - Bootstrap Ubuntu 24.04 LTS chroot with debootstrap (minbase variant)
   - Install minimal packages for live environment
   - Configure autorun.service for automatic execution
-  - Generate squashfs filesystem
-  - Create hybrid ISO with BIOS/UEFI/Secure Boot support
-- **Output**: `hyperv-convert.iso` (~500MB)
+  - Generate squashfs filesystem (XZ compression with x86 BCJ filter)
+  - Create UEFI-only ISO (no BIOS/legacy boot)
+- **Output**: `hyperv-convert-<version>.iso`
 
 #### chroot_setup.sh (Live Environment Setup)
 - **Purpose**: Configures the live environment inside the ISO
-- **Size**: 108 lines
 - **Key Operations**:
-  - Install kernel, systemd, and required utilities
+  - Install kernel (`linux-azure`), systemd, and required utilities
   - Configure systemd-networkd for DHCP
   - Setup autorun.service with OnSuccess=poweroff.target
   - Override getty@tty1 to wait for /run/autorun-done
   - Create ubuntu user for debugging
-  - Package cleanup for minimal footprint
+  - Package cleanup for minimal footprint (--no-install-recommends, apt cache purge)
 
-#### autorun/autorun.sh (Main Conversion Logic)
-- **Purpose**: Executes the complete disk conversion workflow
-- **Size**: 158 lines
+#### autorun/autorun.sh (Clone Workflow)
+- **Purpose**: Executes the full MBR→GPT disk conversion workflow
 - **Key Operations**:
+  - Wait for KVP configuration from host
+  - Route to customize_only.sh if VMCREATE_MODE=customize
   - Disk detection and partition analysis
   - Target disk partitioning (GPT with ESP + root)
   - Partition cloning with real-time progress reporting
-  - Filesystem verification
-  - Mount management and chroot preparation
-  - GRUB and XRDP installation orchestration
-  - Cleanup and shutdown coordination
+  - Filesystem verification and mount management
+  - GRUB bootloader installation
+  - Hyper-V integration daemons, xRDP, PowerShell installation
+  - Automation user creation with SSH key injection
+  - ESP redirect grub.cfg for reliable boot
+  - Cleanup autorun scripts from target and shutdown
+
+#### autorun/customize_only.sh (Customize-Only Workflow)
+- **Purpose**: Applies customizations to an existing GPT image without cloning
+- **Key Operations**:
+  - Detect single partitioned disk, find root + ESP
+  - Mount root (including btrfs subvolume handling)
+  - Mount additional fstab entries (e.g. /home on separate partition)
+  - Install Hyper-V integration daemons, xRDP, PowerShell
+  - Create automation user with SSH key injection
+  - Cleanup autorun scripts from target and shutdown
 
 #### lib/functions.sh (Shared Utilities)
 - **Purpose**: Provides reusable functions for all system components
-- **Size**: 513 lines
 - **Key Functions**:
-  - KVP communication (send_kvp, read_kvp)
+  - KVP communication (send_kvp, read_kvp, read_kvp_value)
   - Progress reporting and logging
   - Retry mechanisms for transient failures
   - Pre-flight validation
@@ -120,6 +137,10 @@ The system follows a deterministic boot sequence from ISO initialization to clea
   - Filesystem verification
   - fstab updating with UUID replacement
   - Mount/unmount coordination
+  - Hyper-V guest package installation (Ubuntu + Debian/Parrot fallback)
+  - Network fixups (netplan, NetworkManager, /etc/network/interfaces)
+  - SSH state capture/restore
+  - Automation user creation (create_automation_user)
 
 ### Specialized Scripts
 
@@ -133,9 +154,16 @@ The system follows a deterministic boot sequence from ISO initialization to clea
 #### autorun/install_xrdp.sh (Enhanced Session)
 - **Purpose**: Installs XRDP for RDP-based Enhanced Session Mode
 - **Operations**:
-  - Package installation (xrdp, desktop environment)
-  - Service configuration
-  - User session setup
+  - Multi-distro package installation (apt, dnf, pacman, zypper)
+  - vsock transport configuration for Hyper-V Enhanced Session
+  - Username pre-fill via `XRDP_USERNAME` environment variable
+
+#### autorun/install_pwsh.sh (PowerShell)
+- **Purpose**: Installs PowerShell on the target VM for post-boot configuration
+- **Operations**:
+  - Multi-distro installation via Microsoft repos
+  - SSH subsystem configuration (`Subsystem powershell /usr/bin/pwsh -sshs`)
+  - Required for PowerShell Direct (Invoke-Command -VMName)
 
 ### System Configuration
 
@@ -194,7 +222,10 @@ Total: 2560 bytes per record
 #### Host-to-Guest (Configuration)
 | Key | Purpose | Value Format | Example |
 |-----|---------|--------------|---------|
+| `VMCREATE_MODE` | Workflow selection | "customize"/"" | "customize" |
 | `VMCREATE_XRDP` | XRDP installation flag | "true"/"false" | "true" |
+| `VMCREATE_XRDP_USERNAME` | Username to pre-fill in xRDP login | username string | "admin" |
+| `VMCREATE_SSH_PUBKEY` | SSH public key for automation user | authorized_keys format | "ssh-ed25519 AAAA..." |
 | `VMCREATE_DEBUG` | Debug mode flag | "true"/"false" | "false" |
 
 ### Implementation Details
@@ -272,9 +303,8 @@ sgdisk --new=1:2048:+512M --typecode=1:ef00 --change-name=1:ESP $new_disk
 # Create root partition (rest of disk, Linux filesystem type)
 sgdisk --new=2::0 --typecode=2:8300 --change-name=2:root $new_disk
 
-# Format partitions
+# Format ESP only — root is overwritten by partclone
 mkfs.vfat -F32 ${new_disk}1
-mkfs.ext4 ${new_disk}2
 ```
 
 ### fstab Transformation

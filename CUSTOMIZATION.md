@@ -63,8 +63,12 @@ Used when the gallery image is MBR-partitioned. The host attaches **two** disks 
 7. Installs GRUB for UEFI boot.
 8. Installs Hyper-V guest daemons + openssh-server.
 9. Optionally installs xRDP.
-10. Removes VirtualBox Guest Additions (many gallery images originate from VBox).
-11. Exits → systemd powers off the VM.
+10. Installs PowerShell for post-boot configuration.
+11. Creates `vmcreate` automation user and injects SSH public key.
+12. Writes ESP redirect grub.cfg for reliable UEFI boot.
+13. Removes VirtualBox Guest Additions (many gallery images originate from VBox).
+14. Cleans up autorun scripts from target.
+15. Exits → systemd powers off the VM.
 
 The host then detaches the original MBR disk and the ISO, leaving only the GPT disk.
 
@@ -75,9 +79,13 @@ Used when the image is already GPT-partitioned. No second disk is needed. The IS
 1. Finds the single partitioned `/dev/sd*` device.
 2. Detects the root partition (checks for `/etc/fstab` + `/bin`).
 3. Mounts root and ESP, sets up bind mounts for chroot.
-4. Installs Hyper-V guest daemons + openssh-server.
-5. Optionally installs xRDP.
-6. Exits → systemd powers off the VM.
+4. Mounts additional fstab entries (e.g. `/home` on separate partition/subvolume).
+5. Installs Hyper-V guest daemons + openssh-server.
+6. Optionally installs xRDP.
+7. Installs PowerShell for post-boot configuration.
+8. Creates `vmcreate` automation user and injects SSH public key.
+9. Cleans up autorun scripts from target.
+10. Exits → systemd powers off the VM.
 
 The host decides which workflow to trigger by sending `VMCREATE_MODE=customize` via KVP for Gen 2 images, or omitting it (defaulting to clone) for Gen 1.
 
@@ -91,7 +99,7 @@ Hyper-V Key-Value Pair (KVP) exchange uses VMBus to pass data between host and g
 
 | Direction | Pool File | Used For |
 |-----------|-----------|----------|
-| Host → Guest | `.kvp_pool_0` | Configuration flags (`VMCREATE_MODE`, `VMCREATE_XRDP`, `VMCREATE_DEBUG`) |
+| Host → Guest | `.kvp_pool_0` | Configuration flags (`VMCREATE_MODE`, `VMCREATE_XRDP`, `VMCREATE_XRDP_USERNAME`, `VMCREATE_SSH_PUBKEY`, `VMCREATE_DEBUG`) |
 | Guest → Host | `.kvp_pool_1` | Progress reporting (`WorkflowProgress`, `PartcloneProgress`) |
 
 ### Host Side (C# / WMI)
@@ -191,13 +199,19 @@ The installation detects the available package manager and adapts:
 
 ```bash
 if command -v apt-get >/dev/null 2>&1; then         # Debian/Ubuntu/Parrot/Kali
-    apt-get install -y -qq hyperv-daemons openssh-server
+    # Try Ubuntu packages first, fall back to Debian's hyperv-daemons
+    if apt-get install -y -qq linux-cloud-tools-common; then
+        apt-get install -y -qq "linux-cloud-tools-${KVER}" || true
+    elif apt-get install -y -qq hyperv-daemons; then
+        echo 'Installed hyperv-daemons (Debian/Parrot)'
+    fi
+    apt-get install -y -qq openssh-server
 elif command -v dnf >/dev/null 2>&1; then            # Fedora
     dnf install -y -q hyperv-daemons openssh-server
 elif command -v yum >/dev/null 2>&1; then            # RHEL/CentOS
     yum install -y -q hyperv-daemons openssh-server
 elif command -v pacman >/dev/null 2>&1; then          # Arch
-    pacman -Sy --noconfirm hyperv openssh
+    pacman -Sy --noconfirm hyperv openssh sudo
 fi
 ```
 
@@ -244,7 +258,7 @@ This means the RDP connection travels over VMBus (AF_VSOCK) rather than the virt
 
 ## Remote Access (SSH & PowerShell Direct)
 
-The ISO provides two mechanisms for the Hyper-V host to run commands inside the guest: **network SSH** (plink/ssh) and **PowerShell Direct** (Invoke-Command over VMBus). Both authenticate with `ubuntu/ubuntu` credentials.
+The ISO provides two mechanisms for the Hyper-V host to run commands inside the guest: **network SSH** (plink/ssh) and **PowerShell Direct** (Invoke-Command over VMBus). The ISO guest uses `ubuntu/ubuntu` credentials. The **target VM** (after conversion) uses a `vmcreate` automation user with SSH key-based authentication — the public key is injected during conversion via the `VMCREATE_SSH_PUBKEY` KVP.
 
 ### How SSH over VMBus Works
 
@@ -275,11 +289,9 @@ The ISO's `chroot_setup.sh` installs everything needed:
 |-----------|---------|---------|
 | SSH server | `openssh-server` | Listens for SSH connections (network + VMBus) |
 | Password auth | `sshd_config` edit | Allows `ubuntu/ubuntu` credential login |
-| PowerShell | `powershell` (from Microsoft repo) | SSH subsystem endpoint for PS remoting |
-| SSH subsystem | `Subsystem powershell` in `sshd_config` | Routes PS Direct sessions to `pwsh -sshs` |
 | VMBus kernel module | `hv_sock` (built into `linux-azure`) | VMBus socket transport |
 
-The `autorun.service` declares `After=ssh.service Wants=ssh.service` so SSH is ready before the autorun script starts.
+PowerShell (`pwsh`) is **not** installed in the ISO itself — it is installed on the **target VM** during conversion via `install_pwsh.sh`, enabling PowerShell Direct for post-boot configuration.
 
 ### Network SSH (plink)
 
@@ -335,7 +347,7 @@ Copy-Item -FromSession $s -Path "/var/log/autorun.log" -Destination "C:\temp\"
 Remove-PSSession $s
 ```
 
-**Key difference from network SSH:** PowerShell Direct requires `pwsh` installed on the guest with the SSH subsystem configured. Without `pwsh`, the SSH connection succeeds but PS remoting fails with:
+**Key difference from network SSH:** PowerShell Direct requires `pwsh` installed on the guest with the SSH subsystem configured. The conversion scripts install this on the **target VM** via `install_pwsh.sh`. Without `pwsh`, the SSH connection succeeds but PS remoting fails with:
 ```
 OpenError: An error has occurred which PowerShell cannot handle.
 A remote session might have ended.
@@ -343,7 +355,7 @@ A remote session might have ended.
 
 ### Limitation
 
-Both access methods only work with the **ISO guest** (which has openssh-server + pwsh built in), not with arbitrary target distro images. Stock images like Parrot Security OS lack `hv_sock` and SSH entirely — `Invoke-Command` hangs indefinitely. This is why the ISO-based chroot approach is the only reliable customization method.
+Both access methods only work with the **ISO guest** (which has openssh-server built in) or the **converted target VM** (which gets openssh-server + pwsh installed during conversion). Stock images like Parrot Security OS lack `hv_sock` and SSH entirely — `Invoke-Command` hangs indefinitely. This is why the ISO-based chroot approach is the only reliable customization method.
 
 ### Test Script
 
@@ -368,13 +380,13 @@ Uses `ubuntu/ubuntu` credentials, waits up to 120 s for SSH readiness.
 
 ### Overview
 
-`build.sh` creates `hyperv-convert.iso` (~500 MB) from scratch using `debootstrap`:
+`build.sh` creates the ISO from scratch using `debootstrap`:
 
 1. **Bootstrap** — `debootstrap --arch=amd64 --variant=minbase noble` creates a minimal Ubuntu 24.04 chroot.
 2. **Copy scripts** — `autorun/*.sh` → `chroot/opt/autorun/`, `lib/functions.sh` → `chroot/opt/lib/`.
 3. **Configure chroot** — Runs `chroot_setup.sh` which installs the kernel (`linux-azure`), disk tools, SSH, and sets up `autorun.service`.
-4. **Create squashfs** — `mksquashfs chroot/ image/casper/filesystem.squashfs`.
-5. **Generate ISO** — `xorriso` creates a hybrid BIOS/UEFI/Secure Boot ISO.
+4. **Create squashfs** — `mksquashfs chroot/ image/casper/filesystem.squashfs -comp xz -b 1M -Xbcj x86`.
+5. **Generate ISO** — `xorriso` creates a UEFI-only ISO (no BIOS/legacy boot).
 
 ### Key Packages in the ISO
 
@@ -384,8 +396,7 @@ Uses `ubuntu/ubuntu` credentials, waits up to 120 s for SSH readiness.
 | `partclone` | Block-level partition cloning |
 | `gdisk` / `sgdisk` | GPT partition table manipulation |
 | `btrfs-progs` | btrfs filesystem tools |
-| `openssh-server` | PowerShell Direct + network SSH support |
-| `powershell` | SSH subsystem endpoint for PS Direct (pwsh -sshs) |
+| `openssh-server` | Network SSH support in the ISO |
 | `sed` | Strip ANSI escape codes from partclone output |
 | `grub-efi-amd64-signed` | Secure Boot compatible GRUB |
 | `shim-signed` | Secure Boot shim loader |
@@ -411,9 +422,9 @@ Uses `ubuntu/ubuntu` credentials, waits up to 120 s for SSH readiness.
 | **xRDP** | RDP server for Hyper-V Enhanced Session Mode (vsock transport) |
 | **AF_VSOCK / hv_sock** | VMBus socket transport for xRDP and PowerShell Direct |
 | **openssh-server** | SSH server for network access and VMBus transport |
-| **PowerShell (pwsh)** | SSH subsystem endpoint for PowerShell Direct remoting |
-| **squashfs** | Read-only compressed filesystem for the live ISO |
-| **xorriso** | ISO 9660 / El Torito image creation (BIOS + UEFI hybrid) |
+| **PowerShell (pwsh)** | Installed on target VM for post-boot PowerShell Direct remoting |
+| **squashfs** | Read-only compressed filesystem for the live ISO (XZ + x86 BCJ) |
+| **xorriso** | ISO 9660 / El Torito image creation (UEFI-only) |
 | **Bash** | All ISO-side automation scripts |
 
 ---
