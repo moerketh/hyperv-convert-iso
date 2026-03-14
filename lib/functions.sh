@@ -744,7 +744,6 @@ install_hyperv_packages() {
     local _kver
     _kver=$(ls "$root/lib/modules/" 2>/dev/null | sort -V | tail -1)
 
-    report_progress "HYPERV_OPTIMIZE" "Installing Hyper-V guest integration services"
     echo "Installing Hyper-V guest optimizations..."
 
     if chroot "$root" /bin/bash -c "

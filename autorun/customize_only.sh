@@ -180,6 +180,7 @@ capture_ssh_state /mnt/new
 fix_apt_repo_conflicts /mnt/new
 
 # ── Hyper-V guest optimization ───────────────────────────────────────
+report_progress "INSTALL_HYPERV_PACKAGES" "Installing Hyper-V guest integration services"
 install_hyperv_packages /mnt/new
 
 # ── Ensure critical services are enabled via direct symlinks ──────────
@@ -244,6 +245,9 @@ else
     echo "No SSH public key in KVP — skipping automation user setup"
 fi
 
+# Clean up autorun scripts from the target VM
+rm -rf /mnt/new/opt/autorun
+
 # Save autorun journal to the target disk so the host can collect it
 # after the VM reboots from the hard drive.
 # Filter to autorun.service only — the full journal includes thousands of
@@ -251,7 +255,7 @@ fi
 journalctl -u autorun.service --no-pager > /mnt/new/var/log/vmcreate-autorun.log 2>&1 || true
 echo "Saved autorun journal to /mnt/new/var/log/vmcreate-autorun.log"
 
-report_progress "CLEANUP" "Customization completed successfully"
+report_progress "REBOOT" "Shutting down VM to apply changes"
 echo "Customize-only mode completed"
 
 # Read debug flag
