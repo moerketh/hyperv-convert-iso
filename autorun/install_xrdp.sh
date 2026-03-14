@@ -109,9 +109,10 @@ sed -i '/^#*ls_title=/c\ls_title='"${PRETTY_NAME}" "$INI"
 
 ###############################################################################
 # Pre-fill login username (passed via XRDP_USERNAME env var from KVP)
+# Modern xrdp.ini no longer has ls_username — set username= in session sections.
 ###############################################################################
 if [ -n "${XRDP_USERNAME:-}" ]; then
-    sed -i '/^#*ls_username=/c\ls_username='"${XRDP_USERNAME}" "$INI"
+    sed -i 's/^username=ask$/username='"${XRDP_USERNAME}"'/' "$INI"
     echo "xRDP: pre-filled login username to '${XRDP_USERNAME}'"
 fi
 
