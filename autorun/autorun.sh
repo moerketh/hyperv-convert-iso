@@ -5,6 +5,7 @@ set -eo pipefail
 source /opt/autorun/../lib/functions.sh
 
 echo "=== autorun.sh started at $(date -Iseconds) ==="
+echo "hyperv-convert-iso version: $(cat /etc/hyperv-convert-version 2>/dev/null || echo 'unknown')"
 
 # ── Diagnostics ──────────────────────────────────────────────────────
 echo "--- Environment ---"

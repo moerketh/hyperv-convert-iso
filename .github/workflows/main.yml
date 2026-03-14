@@ -44,19 +44,26 @@ jobs:
           sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-amd64-signed shim-signed syslinux syslinux-common mtools dosfstools isolinux genisoimage
       - name: Run build script
         run: bash build.sh
+      - name: Determine version and filenames
+        id: version
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          ISO_NAME="hyperv-convert-${VERSION}.iso"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "iso_name=$ISO_NAME" >> $GITHUB_OUTPUT
       - name: Generate SHA256 checksum
-        run: sha256sum hyperv-convert.iso > hyperv-convert.iso.sha256
+        run: sha256sum ${{ steps.version.outputs.iso_name }} > ${{ steps.version.outputs.iso_name }}.sha256
       - name: Upload ISO and checksum as artifact
         if: github.ref_type == 'branch'
         uses: actions/upload-artifact@v4
         with:
-          name: hyperv-convert-iso
+          name: hyperv-convert-iso-${{ steps.version.outputs.version }}
           path: |
-            hyperv-convert.iso
-            hyperv-convert.iso.sha256
+            ${{ steps.version.outputs.iso_name }}
+            ${{ steps.version.outputs.iso_name }}.sha256
       - name: Create release and upload ISO with checksum
         if: github.ref_type == 'tag'
         uses: ncipollo/release-action@v1
         with:
-          artifacts: hyperv-convert.iso,hyperv-convert.iso.sha256
+          artifacts: ${{ steps.version.outputs.iso_name }},${{ steps.version.outputs.iso_name }}.sha256
           generateReleaseNotes: false

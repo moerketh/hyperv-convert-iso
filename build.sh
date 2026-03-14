@@ -7,7 +7,16 @@ set -e
 
 WORK_DIR=$(pwd)
 UBUNTU_VERSION="noble"  # Ubuntu 24.04 LTS
-ISO_NAME="hyperv-convert.iso"
+
+# Read version from VERSION file
+if [ -f "$WORK_DIR/VERSION" ]; then
+    BUILD_VERSION=$(cat "$WORK_DIR/VERSION" | tr -d '[:space:]')
+else
+    BUILD_VERSION="0.0.0-dev"
+fi
+echo "Building hyperv-convert-iso version $BUILD_VERSION"
+
+ISO_NAME="hyperv-convert-${BUILD_VERSION}.iso"
 
 # Abort if running on an NTFS/Windows filesystem (e.g. /mnt/c in WSL).
 # debootstrap needs Unix symlinks, device nodes, and proper permissions which NTFS cannot provide.
@@ -93,6 +102,9 @@ sudo mkdir -p $dest_dir $lib_dir
 # Copy shared library functions (autorun.sh sources ../lib/functions.sh)
 sudo cp ./lib/functions.sh "$lib_dir/functions.sh"
 sudo chmod +x "$lib_dir/functions.sh"
+
+# Embed build version inside the chroot for runtime logging
+echo "$BUILD_VERSION" | sudo tee "chroot/etc/hyperv-convert-version" > /dev/null
 
 for file in "$source_dir"/*.sh; do
   if [ -f "$file" ]; then
