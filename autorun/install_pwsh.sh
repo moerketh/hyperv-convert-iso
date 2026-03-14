@@ -63,9 +63,11 @@ elif is_arch; then
     if command -v yay >/dev/null 2>&1; then
         yay -S --noconfirm powershell-bin 2>&1
     else
-        # Direct install from GitHub releases
-        PWSH_VERSION=$(curl -s https://api.github.com/repos/PowerShell/PowerShell/releases/latest | grep tag_name | cut -d'"' -f4 | sed 's/v//')
+        # Direct install from GitHub releases (pinned version + checksum)
+        PWSH_VERSION="7.5.5"
+        PWSH_SHA256="39A62F466956E3606AEE6637ED0D0735C1ED27612A76DE973B111530DDFF2E77"
         curl -sL "https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VERSION}/powershell-${PWSH_VERSION}-linux-x64.tar.gz" -o /tmp/pwsh.tar.gz
+        echo "${PWSH_SHA256}  /tmp/pwsh.tar.gz" | sha256sum -c - || { echo "ERROR: PowerShell checksum mismatch"; exit 1; }
         mkdir -p /opt/microsoft/powershell/7
         tar xzf /tmp/pwsh.tar.gz -C /opt/microsoft/powershell/7
         chmod +x /opt/microsoft/powershell/7/pwsh

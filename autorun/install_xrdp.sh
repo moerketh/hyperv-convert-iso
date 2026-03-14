@@ -26,7 +26,7 @@ if is_arch; then
   pacman -Syy --noconfirm
   pacman -S --noconfirm base-devel nasm xorg-server openssl pam libxrandr libxfixes
   _xrdp_build=$(mktemp -d)
-  git clone --depth 1 https://github.com/neutrinolabs/xrdp.git "$_xrdp_build/xrdp"
+  git clone --branch v0.10.5 --depth 1 https://github.com/neutrinolabs/xrdp.git "$_xrdp_build/xrdp"
   cd "$_xrdp_build/xrdp"
   ./bootstrap
   ./configure --enable-vsock

@@ -260,6 +260,8 @@ This means the RDP connection travels over VMBus (AF_VSOCK) rather than the virt
 
 The ISO provides two mechanisms for the Hyper-V host to run commands inside the guest: **network SSH** (plink/ssh) and **PowerShell Direct** (Invoke-Command over VMBus). The ISO guest uses `ubuntu/ubuntu` credentials. The **target VM** (after conversion) uses a `vmcreate` automation user with SSH key-based authentication — the public key is injected during conversion via the `VMCREATE_SSH_PUBKEY` KVP.
 
+> **Security note:** The `ubuntu/ubuntu` credentials are **for the ephemeral ISO guest only** — used during the build/conversion process and not carried over to the final target VM.
+
 ### How SSH over VMBus Works
 
 Hyper-V exposes a **VMBus socket** (AF_VSOCK / `hv_sock`) between host and guest. When the guest has `openssh-server` running, the host can establish an SSH connection through this channel — no virtual network adapter required.
