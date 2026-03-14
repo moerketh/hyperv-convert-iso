@@ -647,6 +647,193 @@ EOF
     [ -f "$root/etc/cloud/cloud.cfg.d/99-disable-network.cfg" ]
 }
 
+# ── fix_networkmanager_for_hyperv tests ──────────────────────────────
+
+@test "fix_networkmanager_for_hyperv removes hardcoded VBox connection" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/NetworkManager/system-connections"
+    cat > "$root/etc/NetworkManager/system-connections/Wired.nmconnection" <<'EOF'
+[connection]
+id=Wired connection 1
+type=ethernet
+interface-name=enp0s3
+autoconnect=true
+
+[ipv4]
+method=auto
+EOF
+
+    fix_networkmanager_for_hyperv() {
+        local root="$1"
+        local nm_sys="$root/etc/NetworkManager/system-connections"
+        [ -d "$nm_sys" ] || return 0
+        local found=0
+        for f in "$nm_sys"/*.nmconnection; do
+            [ -f "$f" ] || continue
+            if grep -qE 'interface-name=(enp[0-9]|ens[0-9]|eth[0-9]|enx[0-9a-f])' "$f"; then
+                echo "Removing NM connection with hardcoded interface: $f"
+                rm -f "$f"
+                found=1
+            fi
+        done
+        if [ "$found" -eq 1 ] || ! ls "$nm_sys"/*.nmconnection >/dev/null 2>&1; then
+            echo "Creating generic DHCP connection for Hyper-V"
+            cat > "$nm_sys/hyperv-dhcp.nmconnection" <<'NMCON'
+[connection]
+id=hyperv-dhcp
+type=ethernet
+autoconnect=true
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+NMCON
+            chmod 600 "$nm_sys/hyperv-dhcp.nmconnection"
+        fi
+    }
+
+    run fix_networkmanager_for_hyperv "$root"
+    [ "$status" -eq 0 ]
+    [ ! -f "$root/etc/NetworkManager/system-connections/Wired.nmconnection" ]
+    [ -f "$root/etc/NetworkManager/system-connections/hyperv-dhcp.nmconnection" ]
+    grep -q "method=auto" "$root/etc/NetworkManager/system-connections/hyperv-dhcp.nmconnection"
+}
+
+@test "fix_networkmanager_for_hyperv skips when no NM directory" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root"
+
+    fix_networkmanager_for_hyperv() {
+        local root="$1"
+        local nm_sys="$root/etc/NetworkManager/system-connections"
+        [ -d "$nm_sys" ] || return 0
+    }
+
+    run fix_networkmanager_for_hyperv "$root"
+    [ "$status" -eq 0 ]
+}
+
+@test "fix_networkmanager_for_hyperv keeps non-VBox connections" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/NetworkManager/system-connections"
+    cat > "$root/etc/NetworkManager/system-connections/wifi.nmconnection" <<'EOF'
+[connection]
+id=MyWifi
+type=wifi
+autoconnect=true
+
+[wifi]
+ssid=TestNet
+EOF
+
+    fix_networkmanager_for_hyperv() {
+        local root="$1"
+        local nm_sys="$root/etc/NetworkManager/system-connections"
+        [ -d "$nm_sys" ] || return 0
+        local found=0
+        for f in "$nm_sys"/*.nmconnection; do
+            [ -f "$f" ] || continue
+            if grep -qE 'interface-name=(enp[0-9]|ens[0-9]|eth[0-9]|enx[0-9a-f])' "$f"; then
+                rm -f "$f"
+                found=1
+            fi
+        done
+        if [ "$found" -eq 1 ] || ! ls "$nm_sys"/*.nmconnection >/dev/null 2>&1; then
+            cat > "$nm_sys/hyperv-dhcp.nmconnection" <<'NMCON'
+[connection]
+id=hyperv-dhcp
+type=ethernet
+autoconnect=true
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+NMCON
+            chmod 600 "$nm_sys/hyperv-dhcp.nmconnection"
+        fi
+    }
+
+    run fix_networkmanager_for_hyperv "$root"
+    [ "$status" -eq 0 ]
+    [ -f "$root/etc/NetworkManager/system-connections/wifi.nmconnection" ]
+    # No hardcoded interfaces removed, and existing .nmconnection exists, so no hyperv-dhcp created
+    [ ! -f "$root/etc/NetworkManager/system-connections/hyperv-dhcp.nmconnection" ]
+}
+
+# ── fix_interfaces_for_hyperv tests ──────────────────────────────────
+
+@test "fix_interfaces_for_hyperv replaces enp0s3 with eth0" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network"
+    cat > "$root/etc/network/interfaces" <<'EOF'
+auto lo
+iface lo inet loopback
+
+auto enp0s3
+iface enp0s3 inet dhcp
+EOF
+
+    fix_interfaces_for_hyperv() {
+        local root="$1"
+        local ifaces="$root/etc/network/interfaces"
+        [ -f "$ifaces" ] || return 0
+        if grep -qE '^(auto|allow-hotplug|iface)\s+(enp[0-9]|ens[0-9]|enx[0-9a-f])' "$ifaces"; then
+            echo "Replacing hardcoded interface names in $ifaces"
+            sed -i -E 's/^(auto|allow-hotplug|iface)(\s+)(enp[0-9][a-z0-9]*|ens[0-9][a-z0-9]*|enx[0-9a-f]+)/\1\2eth0/g' "$ifaces"
+        fi
+    }
+
+    run fix_interfaces_for_hyperv "$root"
+    [ "$status" -eq 0 ]
+    grep -q "auto eth0" "$root/etc/network/interfaces"
+    grep -q "iface eth0 inet dhcp" "$root/etc/network/interfaces"
+    ! grep -q "enp0s3" "$root/etc/network/interfaces"
+}
+
+@test "fix_interfaces_for_hyperv skips when no interfaces file" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root"
+
+    fix_interfaces_for_hyperv() {
+        local root="$1"
+        local ifaces="$root/etc/network/interfaces"
+        [ -f "$ifaces" ] || return 0
+    }
+
+    run fix_interfaces_for_hyperv "$root"
+    [ "$status" -eq 0 ]
+}
+
+@test "fix_interfaces_for_hyperv skips when no hardcoded names" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network"
+    cat > "$root/etc/network/interfaces" <<'EOF'
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+EOF
+
+    fix_interfaces_for_hyperv() {
+        local root="$1"
+        local ifaces="$root/etc/network/interfaces"
+        [ -f "$ifaces" ] || return 0
+        if grep -qE '^(auto|allow-hotplug|iface)\s+(enp[0-9]|ens[0-9]|enx[0-9a-f])' "$ifaces"; then
+            echo "Replacing hardcoded interface names in $ifaces"
+            sed -i -E 's/^(auto|allow-hotplug|iface)(\s+)(enp[0-9][a-z0-9]*|ens[0-9][a-z0-9]*|enx[0-9a-f]+)/\1\2eth0/g' "$ifaces"
+        fi
+    }
+
+    run fix_interfaces_for_hyperv "$root"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "" ]]
+}
+
 # ── xRDP username prefill tests ──────────────────────────────────────
 
 @test "install_xrdp prefills ls_username when XRDP_USERNAME is set" {

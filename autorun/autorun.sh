@@ -115,8 +115,8 @@ clone_pipeline_pid=$!
 
 while kill -0 $clone_pipeline_pid 2>/dev/null; do
     if [ -f /tmp/partclone_process.log ]; then
-        # Clean last 20 lines (adjust as needed) with ansifilter
-        cleaned=$(tail -n 20 /tmp/partclone_process.log | ansifilter --text)
+        # Clean last 20 lines — strip ANSI escape codes with sed
+        cleaned=$(tail -n 20 /tmp/partclone_process.log | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
         # Parse with awk: focus on Elapsed lines, extract 6th field as percentage (remove % and ,), 7th as rate number
         progress=$(echo "$cleaned" | awk '
             /Elapsed:/ {
@@ -255,8 +255,10 @@ enable_services_via_symlinks /mnt/new
 # Generate SSH host keys if missing
 generate_ssh_host_keys /mnt/new
 
-# ── Fix netplan: replace hardcoded interface names with match-all ─────
+# ── Fix network configs: replace hardcoded interface names ────────────
 fix_netplan_for_hyperv /mnt/new
+fix_networkmanager_for_hyperv /mnt/new
+fix_interfaces_for_hyperv /mnt/new
 
 # ── Disable cloud-init network override ──────────────────────────────
 disable_cloud_init_network /mnt/new

@@ -386,7 +386,7 @@ Uses `ubuntu/ubuntu` credentials, waits up to 120 s for SSH readiness.
 | `btrfs-progs` | btrfs filesystem tools |
 | `openssh-server` | PowerShell Direct + network SSH support |
 | `powershell` | SSH subsystem endpoint for PS Direct (pwsh -sshs) |
-| `ansifilter` | Strip ANSI escape codes from partclone output |
+| `sed` | Strip ANSI escape codes from partclone output |
 | `grub-efi-amd64-signed` | Secure Boot compatible GRUB |
 | `shim-signed` | Secure Boot shim loader |
 

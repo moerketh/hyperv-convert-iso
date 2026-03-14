@@ -2,11 +2,34 @@
 set -e
 
 # Script to build a custom ISO that runs the autorun script automatically on boot.
-# Supports BIOS, UEFI, and Secure Boot (Select Microsoft UEFI CA)
+# Supports UEFI and Secure Boot (Select Microsoft UEFI CA) — Hyper-V Gen 2 only.
 # Assumes 'autorun.sh' script is in the current directory.
 
 WORK_DIR=$(pwd)
 UBUNTU_VERSION="noble"  # Ubuntu 24.04 LTS
+DNS_PATCHED=false
+
+# ── Cleanup trap ─────────────────────────────────────────────────────
+# If the build is interrupted (Ctrl-C, error with set -e, etc.), make sure
+# we unmount the chroot bind mounts so WSL doesn't end up with dangling
+# mounts that can break on restart.
+cleanup_build() {
+    echo "Cleaning up..."
+    sudo umount -l "$WORK_DIR/chroot/dev/shm" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/dev/pts" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/dev/hugepages" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/dev/mqueue" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/dev" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/run" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/proc" 2>/dev/null || true
+    sudo umount -l "$WORK_DIR/chroot/sys" 2>/dev/null || true
+    # Restore resolv.conf if we patched it
+    if [ "$DNS_PATCHED" = true ] && [ -e /etc/resolv.conf.bak.build ]; then
+        sudo mv /etc/resolv.conf.bak.build /etc/resolv.conf
+        echo "Restored original /etc/resolv.conf"
+    fi
+}
+trap cleanup_build EXIT
 
 # Read version from VERSION file
 if [ -f "$WORK_DIR/VERSION" ]; then
@@ -50,19 +73,29 @@ fi
 
 # ── Ensure DNS works (WSL often has a broken resolv.conf) ────────────
 if ! getent hosts archive.ubuntu.com > /dev/null 2>&1; then
-    echo "DNS resolution failed — fixing /etc/resolv.conf..."
+    echo "DNS resolution failed — attempting temporary fix..."
+    # Preserve the original resolv.conf (often a WSL-managed symlink) so we
+    # can restore it later and avoid permanently breaking WSL networking.
+    if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
+        sudo cp -a /etc/resolv.conf /etc/resolv.conf.bak.build
+    fi
     sudo rm -f /etc/resolv.conf
     printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf > /dev/null
+    DNS_PATCHED=true
     if ! getent hosts archive.ubuntu.com > /dev/null 2>&1; then
         echo "ERROR: DNS still broken after fix. Check your network connection." >&2
+        # Restore original before exiting
+        if [ -e /etc/resolv.conf.bak.build ]; then
+            sudo mv /etc/resolv.conf.bak.build /etc/resolv.conf
+        fi
         exit 1
     fi
-    echo "DNS resolution restored."
+    echo "DNS resolution restored (will revert resolv.conf at end of build)."
 fi
 
 # Install dependencies
 sudo apt-get update
-sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-amd64-signed shim-signed syslinux syslinux-common mtools dosfstools isolinux genisoimage
+sudo apt-get install -y debootstrap squashfs-tools xorriso grub-efi-amd64-bin grub-efi-amd64-signed shim-signed mtools dosfstools
 
 # Bootstrap minimal Ubuntu — try multiple mirrors in case one is unreachable
 UBUNTU_MIRRORS=(
@@ -160,7 +193,7 @@ sudo sed -i '/ubiquity/d' image/casper/filesystem.manifest-desktop
 sudo sed -i '/casper/d' image/casper/filesystem.manifest-desktop
 
 # Compress filesystem
-sudo mksquashfs chroot image/casper/filesystem.squashfs -comp xz -b 1M -Xdict-size 100% -noappend -no-duplicates -no-recovery -wildcards -e "var/cache/apt/archives/*" "root/*" "root/.*" "tmp/*" "tmp/.*" "swapfile" "boot/*"
+sudo mksquashfs chroot image/casper/filesystem.squashfs -comp xz -b 1M -Xdict-size 100% -Xbcj x86 -noappend -no-duplicates -no-recovery -wildcards -e "var/cache/apt/archives/*" "root/*" "root/.*" "tmp/*" "tmp/.*" "swapfile" "boot/*"
 
 # Verify squashfs integrity — catches corrupt xz blocks before they become
 # unbootable ISOs (block 0x301884 failure in PwnCloudOS_20260310112945).
@@ -203,25 +236,12 @@ sudo umount /mnt/efi
 sudo losetup -d "${mloop}"
 sudo rm -rf /mnt/efi
 
-# Create a grub BIOS image
-grub-mkstandalone \
-   --format=i386-pc \
-   --output=isolinux/core.img \
-   --install-modules="linux16 linux normal iso9660 biosdisk memdisk search tar ls" \
-   --modules="linux16 linux normal iso9660 biosdisk search" \
-   --locales="" \
-   --fonts="" \
-   "boot/grub/grub.cfg=isolinux/grub.cfg"
-
-# Combine a bootable Grub cdboot.img
-cat /usr/lib/grub/i386-pc/cdboot.img isolinux/core.img > isolinux/bios.img
-
 # Generate md5sum.txt
 # Remove any stale md5sum.txt first so it doesn't checksum itself
 sudo rm -f md5sum.txt
 sudo /bin/bash -c "(find . -type f -print0 | xargs -0 md5sum | grep -v -e 'isolinux' -e 'md5sum.txt' > md5sum.txt)"
 
-# Create ISO
+# Create ISO (UEFI-only, no BIOS El Torito)
 sudo xorriso \
   -as mkisofs \
   -iso-level 3 \
@@ -229,15 +249,6 @@ sudo xorriso \
   -J -J -joliet-long \
   -volid "Ubuntu Live" \
   -output "../${ISO_NAME}" \
-  -eltorito-boot isolinux/bios.img \
-  -no-emul-boot \
-  -boot-load-size 4 \
-  -boot-info-table \
-  --eltorito-catalog boot.catalog \
-  --grub2-boot-info \
-  --grub2-mbr ../chroot/usr/lib/grub/i386-pc/boot_hybrid.img \
-  -partition_offset 16 \
-  --mbr-force-bootable \
   -eltorito-alt-boot \
   -no-emul-boot \
   -e isolinux/efiboot.img \
@@ -245,7 +256,6 @@ sudo xorriso \
   -appended_part_as_gpt \
   -iso_mbr_part_type a2a0d0ebe5b9334487c068b6b72699c7 \
   -m "isolinux/efiboot.img" \
-  -m "isolinux/bios.img" \
   -e '--interval:appended_partition_2:::' \
   -exclude isolinux \
   -graft-points \
@@ -253,9 +263,10 @@ sudo xorriso \
       "/EFI/boot/mmx64.efi=isolinux/mmx64.efi" \
       "/EFI/boot/grubx64.efi=isolinux/grubx64.efi" \
       "/EFI/ubuntu/grub.cfg=isolinux/grub.cfg" \
-      "/isolinux/bios.img=isolinux/bios.img" \
       "/isolinux/efiboot.img=isolinux/efiboot.img" \
       "."
 
 cd ..
 echo "ISO created at ${WORK_DIR}/${ISO_NAME}"
+
+# cleanup_build runs automatically via the EXIT trap

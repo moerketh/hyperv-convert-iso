@@ -752,10 +752,18 @@ install_hyperv_packages() {
         if command -v apt-get >/dev/null 2>&1; then
             apt-get update -y -qq
             KVER=\"${_kver}\"
-            apt-get install -y -qq linux-cloud-tools-common openssh-server 2>&1
-            if [ -n \"\$KVER\" ]; then
-                apt-get install -y -qq \"linux-cloud-tools-\${KVER}\" 2>&1 || true
+            # Try Ubuntu packages first, fall back to Debian's hyperv-daemons
+            if apt-get install -y -qq linux-cloud-tools-common 2>&1; then
+                echo 'Installed linux-cloud-tools-common (Ubuntu)'
+                if [ -n \"\$KVER\" ]; then
+                    apt-get install -y -qq \"linux-cloud-tools-\${KVER}\" 2>&1 || true
+                fi
+            elif apt-get install -y -qq hyperv-daemons 2>&1; then
+                echo 'Installed hyperv-daemons (Debian/Parrot)'
+            else
+                echo 'WARNING: Could not install Hyper-V integration packages'
             fi
+            apt-get install -y -qq openssh-server 2>&1
         elif command -v dnf >/dev/null 2>&1; then
             dnf install -y -q hyperv-daemons openssh-server 2>&1
         elif command -v yum >/dev/null 2>&1; then
@@ -845,6 +853,57 @@ NETPLAN
                 fi
             fi
         done
+    fi
+}
+
+# Fix NetworkManager connections that reference VirtualBox interface names.
+# Creates a generic DHCP connection for the Hyper-V netvsc adapter.
+# Usage: fix_networkmanager_for_hyperv /mnt/new
+fix_networkmanager_for_hyperv() {
+    local root="$1"
+    local nm_sys="$root/etc/NetworkManager/system-connections"
+    [ -d "$nm_sys" ] || return 0
+
+    local found=0
+    for f in "$nm_sys"/*.nmconnection; do
+        [ -f "$f" ] || continue
+        if grep -qE 'interface-name=(enp[0-9]|ens[0-9]|eth[0-9]|enx[0-9a-f])' "$f"; then
+            echo "Removing NM connection with hardcoded interface: $f"
+            rm -f "$f"
+            found=1
+        fi
+    done
+
+    if [ "$found" -eq 1 ] || ! ls "$nm_sys"/*.nmconnection >/dev/null 2>&1; then
+        echo "Creating generic DHCP connection for Hyper-V"
+        cat > "$nm_sys/hyperv-dhcp.nmconnection" <<'NMCON'
+[connection]
+id=hyperv-dhcp
+type=ethernet
+autoconnect=true
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+NMCON
+        chmod 600 "$nm_sys/hyperv-dhcp.nmconnection"
+    fi
+}
+
+# Fix /etc/network/interfaces that reference VirtualBox interface names.
+# Replaces hardcoded interface names with a wildcard-friendly 'eth0' and
+# ensures DHCP is configured.
+# Usage: fix_interfaces_for_hyperv /mnt/new
+fix_interfaces_for_hyperv() {
+    local root="$1"
+    local ifaces="$root/etc/network/interfaces"
+    [ -f "$ifaces" ] || return 0
+
+    if grep -qE '^(auto|allow-hotplug|iface)\s+(enp[0-9]|ens[0-9]|enx[0-9a-f])' "$ifaces"; then
+        echo "Replacing hardcoded interface names in $ifaces"
+        sed -i -E 's/^(auto|allow-hotplug|iface)(\s+)(enp[0-9][a-z0-9]*|ens[0-9][a-z0-9]*|enx[0-9a-f]+)/\1\2eth0/g' "$ifaces"
     fi
 }
 

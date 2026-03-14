@@ -12,11 +12,65 @@ EOT
 
 apt-get update -y
 apt-get upgrade -y
-apt-get install -y dbus
+apt-get install -y --no-install-recommends dbus
 dbus-uuidgen > /var/lib/dbus/machine-id
 
 # Install kernel, live tools, and necessary packages
-DEBIAN_FRONTEND=noninteractive apt-get install -y linux-azure casper console-setup keyboard-configuration coreutils systemd-sysv net-tools iproute2
+# Resolve the specific kernel version from the linux-azure meta-package so we
+# can install only the image, modules and cloud-tools — skipping the bulky
+# linux-headers and linux-tools that the meta-package pulls in (~150 MB saved).
+# linux-azure → linux-image-azure → linux-image-X.Y.Z-N-azure (two hops)
+KVER=$(apt-cache depends linux-image-azure 2>/dev/null \
+    | grep -o 'linux-image-[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-[0-9][0-9]*-azure' \
+    | sed 's/^linux-image-//' | head -1)
+if [ -z "$KVER" ]; then
+    echo "ERROR: Could not resolve kernel version from linux-image-azure" >&2
+    exit 1
+fi
+echo "Resolved kernel version: $KVER"
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    linux-image-${KVER} linux-modules-${KVER} linux-cloud-tools-${KVER} \
+    casper coreutils systemd-sysv iproute2 zstd
+
+# ── Strip kernel modules not needed for Hyper-V ──────────────────────
+# linux-azure ships hundreds of modules for bare-metal Azure hosts.
+# The live ISO only needs Hyper-V synthetic drivers, storage, filesystems,
+# and basic networking. Removing the rest saves 30-50 MB in the squashfs.
+KMOD_DIR=$(find /lib/modules -maxdepth 1 -mindepth 1 -type d | head -n1)
+if [ -d "$KMOD_DIR/kernel" ]; then
+    echo "Stripping unnecessary kernel modules from $KMOD_DIR ..."
+    # Remove large driver subtrees that are irrelevant inside Hyper-V
+    rm -rf "$KMOD_DIR/kernel/drivers/gpu"
+    rm -rf "$KMOD_DIR/kernel/drivers/net/wireless"
+    rm -rf "$KMOD_DIR/kernel/drivers/bluetooth"
+    rm -rf "$KMOD_DIR/kernel/drivers/media"
+    rm -rf "$KMOD_DIR/kernel/drivers/usb" # no USB passthrough on the live ISO
+    rm -rf "$KMOD_DIR/kernel/drivers/staging"
+    rm -rf "$KMOD_DIR/kernel/drivers/infiniband"
+    rm -rf "$KMOD_DIR/kernel/drivers/isdn"
+    rm -rf "$KMOD_DIR/kernel/drivers/nfc"
+    rm -rf "$KMOD_DIR/kernel/drivers/thunderbolt"
+    rm -rf "$KMOD_DIR/kernel/drivers/firewire"
+    rm -rf "$KMOD_DIR/kernel/drivers/pcmcia"
+    rm -rf "$KMOD_DIR/kernel/drivers/platform"
+    rm -rf "$KMOD_DIR/kernel/drivers/iio"
+    rm -rf "$KMOD_DIR/kernel/drivers/hwmon"
+    rm -rf "$KMOD_DIR/kernel/drivers/leds"
+    rm -rf "$KMOD_DIR/kernel/drivers/input/joystick"
+    rm -rf "$KMOD_DIR/kernel/drivers/input/touchscreen"
+    rm -rf "$KMOD_DIR/kernel/drivers/input/gameport"
+    rm -rf "$KMOD_DIR/kernel/sound"
+    rm -rf "$KMOD_DIR/kernel/net/wireless"
+    rm -rf "$KMOD_DIR/kernel/net/bluetooth"
+    rm -rf "$KMOD_DIR/kernel/net/mac80211"
+    rm -rf "$KMOD_DIR/kernel/net/nfc"
+    # Rebuild module dependency map
+    depmod -a "$(basename "$KMOD_DIR")"
+    echo "Kernel module stripping complete."
+fi
+
+# Purge linux-firmware — Hyper-V uses synthetic drivers, no firmware blobs needed
+apt-get purge -y linux-firmware 2>/dev/null || true
 
 # Configure systemd-networkd for DHCP on Ethernet
 mkdir -p /etc/systemd/network
@@ -32,14 +86,14 @@ EON
 systemctl enable systemd-networkd
 systemctl enable systemd-networkd-wait-online
 
-# Bootloaders for BIOS/UEFI/Secure Boot
-apt-get install -y grub-pc grub-efi-amd64-signed shim-signed
+# Bootloaders for UEFI/Secure Boot (Gen 2 only — no BIOS support)
+apt-get install -y --no-install-recommends grub-efi-amd64-signed shim-signed
 
 # Packages for autorun script (disk tools)
-apt-get install -y partclone gdisk e2fsprogs dosfstools rsync lvm2 efibootmgr os-prober grub2-common util-linux parted psmisc ansifilter binutils
+apt-get install -y --no-install-recommends partclone gdisk e2fsprogs dosfstools rsync lvm2 efibootmgr grub2-common util-linux parted psmisc
 
 # Install btrfs-progs for btrfs root filesystem support (e.g. Parrot OS)
-apt-get install -y btrfs-progs
+apt-get install -y --no-install-recommends btrfs-progs
 
 # ── SSH for PowerShell Direct ────────────────────────────────────────
 # Hyper-V PowerShell Direct on Linux guests uses SSH over VMBus (AF_VSOCK).
@@ -49,29 +103,13 @@ apt-get install -y btrfs-progs
 #   2. Post-boot customization — drive configuration directly instead of KVP signaling
 # Authentication: key-only. The host injects its SSH public key via KVP at boot
 # time. Password auth is disabled for security.
-apt-get install -y openssh-server
+apt-get install -y --no-install-recommends openssh-server
 # Disable password auth — key-only access via KVP-injected pubkey
 sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
 # Enable SSH early so it's available before autorun starts
 systemctl enable ssh
-
-# ── PowerShell (pwsh) for PowerShell Direct ──────────────────────────
-# PowerShell Direct (Invoke-Command -VMName) requires pwsh as the SSH
-# subsystem endpoint. Without it, SSH connects but the PS remoting session
-# fails with "A remote session might have ended."
-# See: https://learn.microsoft.com/en-us/powershell/scripting/install/install-ubuntu
-apt-get install -y wget apt-transport-https
-wget -q "https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb" -O /tmp/packages-microsoft-prod.deb
-dpkg -i /tmp/packages-microsoft-prod.deb
-rm /tmp/packages-microsoft-prod.deb
-apt-get update -y
-apt-get install -y powershell
-
-# Configure SSH subsystem for PowerShell remoting
-# This is what Invoke-Command -VMName actually connects to
-echo "Subsystem powershell /usr/bin/pwsh -sshs -NoLogo -NoProfile" >> /etc/ssh/sshd_config
 
 # User setup — ubuntu user for SSH (key-only auth, no password)
 adduser --disabled-password --gecos "" ubuntu
@@ -204,7 +242,7 @@ apt-get purge -y manpages* libllvm18 libicu74
 
 # Limit locales to English only
 apt-get purge -y locales
-apt-get install -y locales
+apt-get install -y --no-install-recommends locales
 locale-gen en_US.UTF-8
 update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 
