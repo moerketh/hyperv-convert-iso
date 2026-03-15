@@ -10,8 +10,8 @@ This document covers the customization pipeline inside the bootable ISO: how it 
 - [KVP Corruption Mitigation](#kvp-corruption-mitigation)
 - [Filesystem Support](#filesystem-support)
 - [Hyper-V Guest Optimization](#hyper-v-guest-optimization)
-- [xRDP / Enhanced Session Mode](#xrdp--enhanced-session-mode)
-- [Remote Access (SSH & PowerShell Direct)](#remote-access-ssh--powershell-direct)
+- [xRDP](#xrdp)
+- [Remote Access (SSH)](#remote-access-ssh)
 - [ISO Build Pipeline](#iso-build-pipeline)
 - [Technologies](#technologies)
 
@@ -191,7 +191,7 @@ Both workflows install integration daemons that make the guest a first-class Hyp
 | `hv_kvp_daemon` | Host↔guest key-value pair exchange (enables data exchange service) |
 | `hv_vss_daemon` | Volume Shadow Copy integration (enables live checkpoints) |
 | `hv_fcopy_daemon` | Host-to-guest file copy service |
-| `openssh-server` | Enables PowerShell Direct (SSH over VMBus/hv_sock) |
+| `openssh-server` | Enables SSH access for remote management |
 
 ### Multi-Distro Package Manager Support
 
@@ -221,29 +221,15 @@ The optimization step is **non-fatal** — if the guest's package manager fails 
 
 ---
 
-## xRDP / Enhanced Session Mode
+## xRDP
 
 When the user enables xRDP in the VMCreate GUI, the `VMCREATE_XRDP=true` flag is sent via KVP. The customization scripts install and configure xRDP inside the target guest via chroot.
 
 ### How It Works
 
-`install_xrdp.sh` detects the guest distribution using `/etc/os-release` and installs xRDP with the appropriate package manager (apt, dnf, pacman, zypper).
+`install_xrdp.sh` detects the guest distribution using `/etc/os-release` and installs xRDP with the appropriate package manager. xRDP listens on TCP port 3389, so the VM requires a network adapter and an IP address for RDP connections.
 
-### vsock Transport
-
-xRDP is configured to use the **Hyper-V VMBus socket** transport instead of TCP, which enables Enhanced Session Mode without network configuration:
-
-```ini
-; /etc/xrdp/xrdp.ini
-port=vsock://-1:3389
-security_layer=rdp
-crypt_level=none
-```
-
-This means the RDP connection travels over VMBus (AF_VSOCK) rather than the virtual network adapter, providing:
-- Lower latency than TCP
-- No firewall rules needed
-- Works even if the VM has no network connectivity
+The script skips installation if no X11/Xorg display server is found (e.g. server/minimal images), since xRDP requires a graphical session.
 
 ### Supported Distributions
 
@@ -256,48 +242,19 @@ This means the RDP connection travels over VMBus (AF_VSOCK) rather than the virt
 
 ---
 
-## Remote Access (SSH & PowerShell Direct)
+## Remote Access (SSH)
 
-The ISO provides two mechanisms for the Hyper-V host to run commands inside the guest: **network SSH** (plink/ssh) and **PowerShell Direct** (Invoke-Command over VMBus). The ISO guest uses `ubuntu/ubuntu` credentials. The **target VM** (after conversion) uses a `vmcreate` automation user with SSH key-based authentication — the public key is injected during conversion via the `VMCREATE_SSH_PUBKEY` KVP.
+The VM requires a network adapter and an IP address. The host communicates with the guest over **network SSH** using PuTTY's `plink` or standard `ssh`. The ISO guest uses `ubuntu/ubuntu` credentials. The **target VM** (after conversion) uses a `vmcreate` automation user with SSH key-based authentication — the public key is injected during conversion via the `VMCREATE_SSH_PUBKEY` KVP.
 
 > **Security note:** The `ubuntu/ubuntu` credentials are **for the ephemeral ISO guest only** — used during the build/conversion process and not carried over to the final target VM.
 
-### How SSH over VMBus Works
-
-Hyper-V exposes a **VMBus socket** (AF_VSOCK / `hv_sock`) between host and guest. When the guest has `openssh-server` running, the host can establish an SSH connection through this channel — no virtual network adapter required.
-
-```
-┌──────────────────────┐         VMBus (hv_sock)         ┌─────────────────────┐
-│  Hyper-V Host        │◄═══════════════════════════════►│  ISO Guest          │
-│                      │         AF_VSOCK socket          │                     │
-│  Invoke-Command      │───► SSH client ──► VMBus ──────►│  sshd ──► pwsh      │
-│  -VMName "MyVM"      │                                  │    (SSH subsystem)  │
-│  -Credential $cred   │                                  │                     │
-│  -ScriptBlock {...}  │◄─── stdout ◄──── VMBus ◄───────│  command output      │
-└──────────────────────┘                                  └─────────────────────┘
-```
-
-Under the hood:
-1. PowerShell uses `hv_sock` to reach the guest's SSH port without traversing the network stack
-2. SSH authenticates with password credentials
-3. The `Subsystem powershell` directive in `sshd_config` launches `pwsh -sshs` as the remoting endpoint
-4. PowerShell serializes objects over the SSH channel (PSRP over SSH)
-
 ### Guest Requirements
 
-The ISO's `chroot_setup.sh` installs everything needed:
-
-| Component | Package | Purpose |
-|-----------|---------|---------|
-| SSH server | `openssh-server` | Listens for SSH connections (network + VMBus) |
-| Password auth | `sshd_config` edit | Allows `ubuntu/ubuntu` credential login |
-| VMBus kernel module | `hv_sock` (built into `linux-azure`) | VMBus socket transport |
-
-PowerShell (`pwsh`) is **not** installed in the ISO itself — it is installed on the **target VM** during conversion via `install_pwsh.sh`, enabling PowerShell Direct for post-boot configuration.
+The ISO's `chroot_setup.sh` installs `openssh-server` with password authentication enabled. PowerShell (`pwsh`) is installed on the **target VM** during conversion via `install_pwsh.sh` for post-boot configuration.
 
 ### Network SSH (plink)
 
-When the VM has a network adapter, standard SSH works over the virtual network. This is useful for interactive debugging from a Windows terminal using PuTTY's `plink`:
+SSH over the virtual network is used for both programmatic access and interactive debugging:
 
 ```powershell
 # Get the VM's IP address
@@ -325,39 +282,9 @@ plink -ssh ubuntu@172.24.137.116 -pw ubuntu -hostkey "SHA256:..." `
 
 > **Note:** The first plink connection requires accepting the host key. Pipe `echo y |` or use `-hostkey` with the fingerprint. The `ssh` command with `-o StrictHostKeyChecking=no` also works but requires `sshpass` for non-interactive password auth on Windows.
 
-### PowerShell Direct (Invoke-Command)
-
-PowerShell Direct is the preferred programmatic access method — it works over VMBus without any network dependency. This is what the VMCreate GUI uses.
-
-```powershell
-# Create credentials
-$cred = New-Object PSCredential("ubuntu", (ConvertTo-SecureString "ubuntu" -AsPlainText -Force))
-
-# Run a command in the ISO guest
-$result = Invoke-Command -VMName "MyVM_20260307230223" -Credential $cred -ScriptBlock {
-    hostname
-    systemctl status autorun.service 2>&1 | Out-String
-    journalctl -u autorun.service --no-pager -n 50 2>&1 | Out-String
-}
-
-# Interactive session
-Enter-PSSession -VMName "MyVM_20260307230223" -Credential $cred
-
-# Copy a file from the guest to the host
-$s = New-PSSession -VMName "MyVM_20260307230223" -Credential $cred
-Copy-Item -FromSession $s -Path "/var/log/autorun.log" -Destination "C:\temp\"
-Remove-PSSession $s
-```
-
-**Key difference from network SSH:** PowerShell Direct requires `pwsh` installed on the guest with the SSH subsystem configured. The conversion scripts install this on the **target VM** via `install_pwsh.sh`. Without `pwsh`, the SSH connection succeeds but PS remoting fails with:
-```
-OpenError: An error has occurred which PowerShell cannot handle.
-A remote session might have ended.
-```
-
 ### Limitation
 
-Both access methods only work with the **ISO guest** (which has openssh-server built in) or the **converted target VM** (which gets openssh-server + pwsh installed during conversion). Stock images like Parrot Security OS lack `hv_sock` and SSH entirely — `Invoke-Command` hangs indefinitely. This is why the ISO-based chroot approach is the only reliable customization method.
+SSH only works with the **ISO guest** (which has openssh-server built in) or the **converted target VM** (which gets openssh-server installed during conversion). Stock images like Parrot Security OS lack SSH entirely. This is why the ISO-based chroot approach is the only reliable customization method.
 
 ### Test Script
 
@@ -414,17 +341,16 @@ Uses `ubuntu/ubuntu` credentials, waits up to 120 s for SSH readiness.
 | Technology | Role |
 |------------|------|
 | **Hyper-V KVP (Key-Value Pair) Exchange** | Host↔guest communication over VMBus without network |
-| **VMBus** | High-speed Hyper-V paravirtualized bus for I/O, KVP, and vsock |
+| **VMBus** | High-speed Hyper-V paravirtualized bus for I/O and KVP |
 | **Ubuntu 24.04 LTS (Noble)** | ISO base operating system (debootstrapped) |
 | **debootstrap** | Builds minimal Ubuntu chroot from scratch |
 | **systemd** | ISO service management — `autorun.service` with `OnSuccess=poweroff.target` |
 | **partclone** | Block-level partition cloning with progress reporting |
 | **sgdisk** | GPT partition table manipulation |
 | **GRUB 2 (EFI)** | Bootloader installation in cloned systems |
-| **xRDP** | RDP server for Hyper-V Enhanced Session Mode (vsock transport) |
-| **AF_VSOCK / hv_sock** | VMBus socket transport for xRDP and PowerShell Direct |
-| **openssh-server** | SSH server for network access and VMBus transport |
-| **PowerShell (pwsh)** | Installed on target VM for post-boot PowerShell Direct remoting |
+| **xRDP** | RDP server for graphical remote desktop access (TCP) |
+| **openssh-server** | SSH server for network-based remote access |
+| **PowerShell (pwsh)** | Installed on target VM for post-boot configuration |
 | **squashfs** | Read-only compressed filesystem for the live ISO (XZ + x86 BCJ) |
 | **xorriso** | ISO 9660 / El Torito image creation (UEFI-only) |
 | **Bash** | All ISO-side automation scripts |
@@ -433,9 +359,9 @@ Uses `ubuntu/ubuntu` credentials, waits up to 120 s for SSH readiness.
 
 ## Design Decisions
 
-### Why a bootable ISO instead of PowerShell Direct?
+### Why a bootable ISO instead of direct SSH?
 
-PowerShell Direct (SSH over VMBus) only works when the guest already has `openssh-server`, `pwsh`, and `hv_sock` loaded. Stock gallery images (Parrot, Kali, etc.) don't ship with these — `Invoke-Command` hangs indefinitely. The ISO provides a known-good environment that can reach into any guest via chroot. The ISO's own PowerShell Direct support is used for **monitoring and error collection**, not for driving the customization itself.
+SSH only works when the guest already has `openssh-server` installed and a network connection. Stock gallery images (Parrot, Kali, etc.) often lack SSH entirely. The ISO provides a known-good environment that can reach into any guest via chroot, regardless of what the guest ships with.
 
 ### Why padding KVPs instead of longer delays?
 
@@ -448,10 +374,6 @@ The ISO cannot `apt-get install` packages into a powered-off VHDX. By booting th
 ### Why non-fatal optimization steps?
 
 Distribution images vary widely — some have expired GPG keys, missing repositories, or custom package managers. Making `hyperv-daemons` and `openssh-server` installation non-fatal ensures the VM always boots, even if optimization partially fails. The user gets a warning but not a broken VM.
-
-### Why vsock transport for xRDP?
-
-The `vsock://-1:3389` transport routes RDP traffic through VMBus instead of TCP. This enables Enhanced Session Mode without firewall rules, network configuration, or even a virtual network adapter. It's faster, more secure, and works in air-gapped scenarios.
 
 ### Why `linux-azure` kernel?
 
