@@ -115,18 +115,33 @@ clone_pipeline_pid=$!
 
 while kill -0 $clone_pipeline_pid 2>/dev/null; do
     if [ -f /tmp/partclone_process.log ]; then
-        # Clean last 20 lines — strip ANSI escape codes with sed
-        cleaned=$(tail -n 20 /tmp/partclone_process.log | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
-        # Parse with awk: focus on Elapsed lines, extract 6th field as percentage (remove % and ,), 7th as rate number
+        # Clean last 20 lines — convert \r to \n (partclone uses \r for in-place
+        # updates), then strip ANSI escape codes.
+        cleaned=$(tail -n 20 /tmp/partclone_process.log | tr '\r' '\n' | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
+        # Parse with awk: use regex to extract percentage and rate from Elapsed lines.
+        # Partclone rate may be in GB/min, MB/min, or KB/min — forward the actual unit.
         progress=$(echo "$cleaned" | awk '
             /Elapsed:/ {
-                perc = $6;
-                gsub(/[%,\s]/, "", perc);  # Remove %, ,, and any spaces
-                rate = $7;
-                gsub(/[\s]/, "", rate);  # Clean rate if needed
-                print "Progress: " perc "% | Rate: " rate " GB/min"
+                perc = ""
+                rate = ""
+                for (i = 1; i <= NF; i++) {
+                    if (perc == "" && $i ~ /^[0-9.]+%/) {
+                        perc = $i
+                        gsub(/[%,]/, "", perc)
+                    }
+                    if (rate == "" && $i ~ /[0-9][GgMmKk][Bb]\/min/) {
+                        rate = $i
+                        gsub(/,$/, "", rate)
+                    }
+                }
+                if (perc != "") {
+                    if (rate != "")
+                        print "Progress: " perc "% | Rate: " rate
+                    else
+                        print "Progress: " perc "%"
+                }
             }
-        ' | tail -n 1)  # Take the last matching line to get the most recent update
+        ' | tail -n 1)
 
         if [ -n "$progress" ]; then
             send_kvp "PartcloneProgress" "$progress"
