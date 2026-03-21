@@ -30,8 +30,30 @@ if is_arch; then
   grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   grub-mkconfig -o /boot/grub/grub.cfg
 elif is_debian; then
+  # Preserve oem-config if present — GRUB package changes can pull it in
+  # as a cascade removal, breaking the OEM first-boot wizard.
+  oem_held=false
+  if dpkg -l oem-config 2>/dev/null | grep -q '^ii'; then
+    apt-mark hold oem-config oem-config-gtk 2>/dev/null || true
+    oem_held=true
+  fi
+
   apt-get update --allow-releaseinfo-change -y || apt-get update -y
-  apt-get install -y grub-efi-amd64 efibootmgr os-prober
+
+  if ! apt-get install -y grub-efi-amd64 efibootmgr os-prober; then
+    # Hold may have caused a conflict — unhold, retry, then reinstall oem-config
+    if $oem_held; then
+      apt-mark unhold oem-config oem-config-gtk 2>/dev/null || true
+      apt-get install -y grub-efi-amd64 efibootmgr os-prober
+      apt-get install -y oem-config oem-config-gtk || true
+      oem_held=false
+    fi
+  fi
+
+  if $oem_held; then
+    apt-mark unhold oem-config oem-config-gtk 2>/dev/null || true
+  fi
+
   export PATH=$PATH:/usr/sbin:/sbin
   grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   update-grub
