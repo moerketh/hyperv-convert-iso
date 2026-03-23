@@ -95,6 +95,11 @@ apt-get install -y --no-install-recommends partclone gdisk e2fsprogs dosfstools 
 # Install btrfs-progs for btrfs root filesystem support (e.g. Parrot OS)
 apt-get install -y --no-install-recommends btrfs-progs
 
+# Install Tor daemon for distros that route APT through Tor (e.g. Whonix).
+# NOT enabled at boot — started on-demand by autorun when tor+ APT sources
+# are detected in the target VM's chroot.
+apt-get install -y --no-install-recommends tor
+
 # ── SSH for PowerShell Direct ────────────────────────────────────────
 # Hyper-V PowerShell Direct on Linux guests uses SSH over VMBus (AF_VSOCK).
 # This lets the host run commands inside the ISO guest without any network,

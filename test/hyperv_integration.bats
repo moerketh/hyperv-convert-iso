@@ -834,86 +834,387 @@ EOF
     [[ "$output" == "" ]]
 }
 
-# ── xRDP username prefill tests ──────────────────────────────────────
+# ── _has_tor_apt_sources tests ───────────────────────────────────────
 
-@test "install_xrdp prefills ls_username when XRDP_USERNAME is set" {
-    local ini="$TEST_TEMP_DIR/xrdp.ini"
-    cat > "$ini" << 'EOF'
-[Globals]
-port=3389
-#ls_username=ask
-ls_title=Test
+@test "_has_tor_apt_sources detects tor+https in sources.list" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/apt/sources.list.d"
+    cat > "$root/etc/apt/sources.list" << 'EOF'
+deb tor+https://deb.debian.org/debian trixie main
+deb tor+https://deb.debian.org/debian-security trixie-security main
 EOF
 
-    run bash -c "
-        XRDP_USERNAME=remnux
-        INI='$ini'
-        if [ -n \"\${XRDP_USERNAME:-}\" ]; then
-            sed -i '/^#*ls_username=/c\\ls_username='\"\${XRDP_USERNAME}\" \"\$INI\"
+    _has_tor_apt_sources() {
+        local root="$1"
+        [ -d "$root/etc/apt" ] || return 1
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/"*.list 2>/dev/null; then
+            return 0
         fi
-    "
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list.d/"*.sources 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    }
+
+    run _has_tor_apt_sources "$root"
     [ "$status" -eq 0 ]
-    grep -q '^ls_username=remnux' "$ini"
-    ! grep -q '#ls_username' "$ini"
 }
 
-@test "install_xrdp does not modify ls_username when XRDP_USERNAME is empty" {
-    local ini="$TEST_TEMP_DIR/xrdp.ini"
-    cat > "$ini" << 'EOF'
-[Globals]
-port=3389
-#ls_username=ask
-ls_title=Test
+@test "_has_tor_apt_sources detects tor+https in .list file" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/apt/sources.list.d"
+    touch "$root/etc/apt/sources.list"
+    cat > "$root/etc/apt/sources.list.d/whonix.list" << 'EOF'
+deb tor+https://fasttrack.debian.net/debian-fasttrack trixie-fasttrack main
 EOF
 
-    run bash -c "
-        XRDP_USERNAME=''
-        INI='$ini'
-        if [ -n \"\${XRDP_USERNAME:-}\" ]; then
-            sed -i '/^#*ls_username=/c\\ls_username='\"\${XRDP_USERNAME}\" \"\$INI\"
+    _has_tor_apt_sources() {
+        local root="$1"
+        [ -d "$root/etc/apt" ] || return 1
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/"*.list 2>/dev/null; then
+            return 0
         fi
-    "
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list.d/"*.sources 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    }
+
+    run _has_tor_apt_sources "$root"
     [ "$status" -eq 0 ]
-    grep -q '#ls_username=ask' "$ini"
 }
 
-@test "install_xrdp does not modify ls_username when XRDP_USERNAME is unset" {
-    local ini="$TEST_TEMP_DIR/xrdp.ini"
-    cat > "$ini" << 'EOF'
-[Globals]
-port=3389
-#ls_username=ask
-ls_title=Test
+@test "_has_tor_apt_sources detects tor+https in DEB822 .sources file" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/apt/sources.list.d"
+    touch "$root/etc/apt/sources.list"
+    cat > "$root/etc/apt/sources.list.d/debian.sources" << 'EOF'
+Types: deb
+URIs: tor+https://deb.debian.org/debian
+Suites: trixie
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 EOF
 
-    run bash -c "
-        unset XRDP_USERNAME
-        INI='$ini'
-        if [ -n \"\${XRDP_USERNAME:-}\" ]; then
-            sed -i '/^#*ls_username=/c\\ls_username='\"\${XRDP_USERNAME}\" \"\$INI\"
+    _has_tor_apt_sources() {
+        local root="$1"
+        [ -d "$root/etc/apt" ] || return 1
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/"*.list 2>/dev/null; then
+            return 0
         fi
-    "
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list.d/"*.sources 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    }
+
+    run _has_tor_apt_sources "$root"
     [ "$status" -eq 0 ]
-    grep -q '#ls_username=ask' "$ini"
 }
 
-@test "install_xrdp handles uncommented ls_username setting" {
-    local ini="$TEST_TEMP_DIR/xrdp.ini"
-    cat > "$ini" << 'EOF'
-[Globals]
-port=3389
-ls_username=ask
-ls_title=Test
+@test "_has_tor_apt_sources returns false for normal https sources" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/apt/sources.list.d"
+    cat > "$root/etc/apt/sources.list" << 'EOF'
+deb https://deb.debian.org/debian trixie main
+deb http://security.debian.org/debian-security trixie-security main
 EOF
 
-    run bash -c "
-        XRDP_USERNAME=kali
-        INI='$ini'
-        if [ -n \"\${XRDP_USERNAME:-}\" ]; then
-            sed -i '/^#*ls_username=/c\\ls_username='\"\${XRDP_USERNAME}\" \"\$INI\"
+    _has_tor_apt_sources() {
+        local root="$1"
+        [ -d "$root/etc/apt" ] || return 1
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/"*.list 2>/dev/null; then
+            return 0
         fi
-    "
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list.d/"*.sources 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    }
+
+    run _has_tor_apt_sources "$root"
+    [ "$status" -ne 0 ]
+}
+
+@test "_has_tor_apt_sources returns false when no /etc/apt directory" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc"
+    # No /etc/apt — e.g. Arch or Fedora
+
+    _has_tor_apt_sources() {
+        local root="$1"
+        [ -d "$root/etc/apt" ] || return 1
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/"*.list 2>/dev/null; then
+            return 0
+        fi
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list.d/"*.sources 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    }
+
+    run _has_tor_apt_sources "$root"
+    [ "$status" -ne 0 ]
+}
+
+@test "_has_tor_apt_sources detects tor+http (non-TLS)" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/apt/sources.list.d"
+    cat > "$root/etc/apt/sources.list" << 'EOF'
+deb tor+http://deb.debian.org/debian trixie main
+EOF
+
+    _has_tor_apt_sources() {
+        local root="$1"
+        [ -d "$root/etc/apt" ] || return 1
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/"*.list 2>/dev/null; then
+            return 0
+        fi
+        if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list.d/"*.sources 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    }
+
+    run _has_tor_apt_sources "$root"
     [ "$status" -eq 0 ]
-    grep -q '^ls_username=kali' "$ini"
-    ! grep -q 'ls_username=ask' "$ini"
+}
+
+# ── configure_temp_nic tests ─────────────────────────────────────────
+
+_test_needs_temp_nic() {
+    local root="$1"
+    local ifaces="$root/etc/network/interfaces"
+    local ifaces_d="$root/etc/network/interfaces.d"
+    [ -f "$ifaces" ] || return 1
+    grep -rqE '^\s*iface\s+\S+\s+inet\s+static' "$ifaces" "$ifaces_d" 2>/dev/null || return 1
+    grep -rqE '^\s*iface\s+\S+\s+inet\s+dhcp' "$ifaces" "$ifaces_d" 2>/dev/null && return 1
+    ls "$root/etc/netplan/"*.yaml >/dev/null 2>&1 && return 1
+    [ -d "$root/etc/NetworkManager/system-connections" ] && \
+        [ "$(ls -A "$root/etc/NetworkManager/system-connections/" 2>/dev/null)" ] && return 1
+    ls "$root/etc/systemd/network/"*.network >/dev/null 2>&1 && return 1
+    return 0
+}
+
+_test_configure_temp_nic() {
+    local root="$1"
+    _test_needs_temp_nic "$root" || return 0
+    echo "Static-only ifupdown networking detected — configuring temporary NIC (eth1)"
+
+    local ifaces="$root/etc/network/interfaces"
+    if [ -f "$ifaces" ]; then
+        if ! grep -q 'source /etc/network/interfaces.d/' "$ifaces" && \
+           ! grep -q 'source-directory /etc/network/interfaces.d' "$ifaces"; then
+            echo "" >> "$ifaces"
+            echo "source /etc/network/interfaces.d/*" >> "$ifaces"
+            echo "Added interfaces.d source line to $ifaces"
+        fi
+    fi
+
+    mkdir -p "$root/etc/network/interfaces.d"
+    cat > "$root/etc/network/interfaces.d/vmcreate-temp-dhcp" <<'EOF'
+auto eth1
+iface eth1 inet dhcp
+EOF
+    echo "Created /etc/network/interfaces.d/vmcreate-temp-dhcp"
+
+    mkdir -p "$root/usr/local/bin"
+    cat > "$root/usr/local/bin/vmcreate-temp-net.sh" <<'SCRIPT'
+#!/bin/bash
+set -e
+pkill -f 'dhclient.*eth1' || true
+pkill -f 'dhcpcd.*eth1' || true
+sleep 1
+ip link show eth1 || true
+if command -v nft >/dev/null 2>&1; then
+    nft insert rule inet filter input  iifname "eth1" counter accept 2>/dev/null || true
+    nft insert rule inet filter output oifname "eth1" counter accept 2>/dev/null || true
+    nft insert rule ip filter INPUT  iifname "eth1" counter accept 2>/dev/null || true
+    nft insert rule ip filter OUTPUT oifname "eth1" counter accept 2>/dev/null || true
+fi
+if command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT  -i eth1 -j ACCEPT || true
+    iptables -I OUTPUT -o eth1 -j ACCEPT || true
+fi
+ip link set eth1 up || true
+if command -v dhclient >/dev/null 2>&1; then
+    dhclient -1 eth1 || true
+elif command -v dhcpcd >/dev/null 2>&1; then
+    dhcpcd -1 eth1 || true
+elif command -v udhcpc >/dev/null 2>&1; then
+    udhcpc -i eth1 -n -q || true
+else
+    ifup eth1 2>/dev/null || true
+fi
+SCRIPT
+    chmod 755 "$root/usr/local/bin/vmcreate-temp-net.sh"
+    echo "Created /usr/local/bin/vmcreate-temp-net.sh"
+
+    mkdir -p "$root/etc/systemd/system"
+    cat > "$root/etc/systemd/system/vmcreate-temp-net.service" <<'UNIT'
+[Unit]
+Description=VMCreate temporary NIC setup (firewall + DHCP on eth1)
+After=network.target
+Before=ssh.service sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/vmcreate-temp-net.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    echo "Created /etc/systemd/system/vmcreate-temp-net.service"
+
+    mkdir -p "$root/etc/systemd/system/multi-user.target.wants"
+    ln -sf /etc/systemd/system/vmcreate-temp-net.service \
+        "$root/etc/systemd/system/multi-user.target.wants/vmcreate-temp-net.service"
+    echo "Enabled vmcreate-temp-net.service"
+
+    mkdir -p "$root/var/lib/vmcreate"
+    cat > "$root/var/lib/vmcreate/restore_net.sh" <<'CLEANUP'
+#!/bin/bash
+set -e
+systemctl disable vmcreate-temp-net.service 2>/dev/null || true
+rm -f /etc/systemd/system/vmcreate-temp-net.service
+rm -f /etc/systemd/system/multi-user.target.wants/vmcreate-temp-net.service
+rm -f /usr/local/bin/vmcreate-temp-net.sh
+rm -f /etc/network/interfaces.d/vmcreate-temp-dhcp
+ip link set eth1 down 2>/dev/null || true
+rm -f /var/lib/vmcreate/restore_net.sh
+echo 'Temporary NIC configuration removed'
+CLEANUP
+    chmod 755 "$root/var/lib/vmcreate/restore_net.sh"
+    echo "Created cleanup script /var/lib/vmcreate/restore_net.sh"
+}
+
+@test "configure_temp_nic creates full setup for static-only ifupdown" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network"
+    printf 'auto eth0\niface eth0 inet static\n  address 10.152.152.15\nsource /etc/network/interfaces.d/*\n' > "$root/etc/network/interfaces"
+
+    run _test_configure_temp_nic "$root"
+    [ "$status" -eq 0 ]
+
+    # interfaces.d DHCP config
+    [ -f "$root/etc/network/interfaces.d/vmcreate-temp-dhcp" ]
+    grep -q 'auto eth1' "$root/etc/network/interfaces.d/vmcreate-temp-dhcp"
+    grep -q 'iface eth1 inet dhcp' "$root/etc/network/interfaces.d/vmcreate-temp-dhcp"
+
+    # systemd service + script
+    [ -f "$root/usr/local/bin/vmcreate-temp-net.sh" ]
+    [ -x "$root/usr/local/bin/vmcreate-temp-net.sh" ]
+    [ -f "$root/etc/systemd/system/vmcreate-temp-net.service" ]
+    [ -L "$root/etc/systemd/system/multi-user.target.wants/vmcreate-temp-net.service" ]
+    grep -q 'nft insert rule inet filter' "$root/usr/local/bin/vmcreate-temp-net.sh"
+    grep -q 'nft insert rule ip filter' "$root/usr/local/bin/vmcreate-temp-net.sh"
+    grep -q 'iptables -I INPUT' "$root/usr/local/bin/vmcreate-temp-net.sh"
+    grep -q 'dhclient -1 eth1' "$root/usr/local/bin/vmcreate-temp-net.sh"
+    grep -q 'Before=ssh.service' "$root/etc/systemd/system/vmcreate-temp-net.service"
+
+    # cleanup script
+    [ -f "$root/var/lib/vmcreate/restore_net.sh" ]
+    [ -x "$root/var/lib/vmcreate/restore_net.sh" ]
+    grep -q 'systemctl disable vmcreate-temp-net' "$root/var/lib/vmcreate/restore_net.sh"
+    grep -q 'rm -f /usr/local/bin/vmcreate-temp-net.sh' "$root/var/lib/vmcreate/restore_net.sh"
+    grep -q 'rm -f /etc/network/interfaces.d/vmcreate-temp-dhcp' "$root/var/lib/vmcreate/restore_net.sh"
+
+    [[ "$output" =~ "Static-only ifupdown" ]]
+}
+
+@test "configure_temp_nic detects static config in interfaces.d" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network/interfaces.d"
+    # Main file only sources interfaces.d (like real Whonix)
+    printf 'source /etc/network/interfaces.d/*\n' > "$root/etc/network/interfaces"
+    # Static config lives in an included file
+    printf 'auto eth0\niface eth0 inet static\n  address 10.152.152.11\n' > "$root/etc/network/interfaces.d/30_non-qubes-whonix"
+
+    run _test_configure_temp_nic "$root"
+    [ "$status" -eq 0 ]
+    [ -f "$root/usr/local/bin/vmcreate-temp-net.sh" ]
+    [ -f "$root/etc/systemd/system/vmcreate-temp-net.service" ]
+    [ -f "$root/var/lib/vmcreate/restore_net.sh" ]
+    [[ "$output" =~ "Static-only ifupdown" ]]
+}
+
+@test "configure_temp_nic is no-op when guest uses DHCP" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network"
+    printf 'auto eth0\niface eth0 inet dhcp\n' > "$root/etc/network/interfaces"
+
+    run _test_configure_temp_nic "$root"
+    [ "$status" -eq 0 ]
+    [ ! -f "$root/var/lib/vmcreate/restore_net.sh" ]
+    [ -z "$output" ]
+}
+
+@test "configure_temp_nic is no-op when DHCP is in interfaces.d" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network/interfaces.d"
+    printf 'source /etc/network/interfaces.d/*\n' > "$root/etc/network/interfaces"
+    printf 'auto eth0\niface eth0 inet dhcp\n' > "$root/etc/network/interfaces.d/50-dhcp"
+
+    run _test_configure_temp_nic "$root"
+    [ "$status" -eq 0 ]
+    [ ! -f "$root/var/lib/vmcreate/restore_net.sh" ]
+    [ -z "$output" ]
+}
+
+@test "configure_temp_nic triggers when DHCP line is commented out (Whonix)" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network/interfaces.d"
+    printf 'source /etc/network/interfaces.d/*\n' > "$root/etc/network/interfaces"
+    # Whonix has static eth0 plus a commented-out DHCP line
+    cat > "$root/etc/network/interfaces.d/30_non-qubes-whonix" <<'EOF'
+auto eth0
+iface eth0 inet static
+       address 10.152.152.11
+       netmask 255.255.192.0
+       gateway 10.152.152.10
+#iface eth0 inet dhcp
+EOF
+
+    run _test_configure_temp_nic "$root"
+    [ "$status" -eq 0 ]
+    [ -f "$root/etc/network/interfaces.d/vmcreate-temp-dhcp" ]
+    [ -f "$root/var/lib/vmcreate/restore_net.sh" ]
+    [[ "$output" =~ "Static-only ifupdown networking detected" ]]
+}
+
+@test "configure_temp_nic is no-op without ifupdown" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc"
+    # No /etc/network/interfaces at all
+
+    run _test_configure_temp_nic "$root"
+    [ "$status" -eq 0 ]
+    [ ! -f "$root/var/lib/vmcreate/restore_net.sh" ]
+    [ -z "$output" ]
+}
+
+@test "configure_temp_nic adds source line when missing" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network"
+    printf 'auto eth0\niface eth0 inet static\n  address 10.152.152.15\n' > "$root/etc/network/interfaces"
+
+    run _test_configure_temp_nic "$root"
+    [ "$status" -eq 0 ]
+    grep -q 'source /etc/network/interfaces.d/\*' "$root/etc/network/interfaces"
+    [ -f "$root/etc/network/interfaces.d/vmcreate-temp-dhcp" ]
+    [[ "$output" =~ "Added interfaces.d source line" ]]
+}
+
+@test "configure_temp_nic does not duplicate source line" {
+    local root="$TEST_TEMP_DIR/rootfs"
+    mkdir -p "$root/etc/network"
+    printf 'auto eth0\niface eth0 inet static\nsource /etc/network/interfaces.d/*\n' > "$root/etc/network/interfaces"
+
+    run _test_configure_temp_nic "$root"
+    [ "$status" -eq 0 ]
+    local count
+    count=$(grep -c 'source /etc/network/interfaces.d/' "$root/etc/network/interfaces")
+    [ "$count" -eq 1 ]
+    [[ ! "$output" =~ "Added interfaces.d source line" ]]
 }

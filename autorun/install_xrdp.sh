@@ -65,8 +65,13 @@ ExecStop=/usr/local/sbin/xrdp-sesman --kill
 WantedBy=multi-user.target
 SESUNIT
 elif is_debian; then
+  # Prevent service-start failures from breaking dpkg in chroot.
+  # xrdp's postinst tries to start the daemon and treats failure as fatal.
+  printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+  chmod +x /usr/sbin/policy-rc.d
   apt-get update -y
   apt-get install -y xrdp
+  rm -f /usr/sbin/policy-rc.d
   adduser xrdp ssl-cert || true
 elif is_fedora; then
   dnf install -y xrdp
@@ -106,15 +111,6 @@ sed -i '/^\[Globals\]/,/^\[/{s/^autorun=.*/autorun=Xorg/}' "$INI"
 # Login screen title — use distro pretty name
 ###############################################################################
 sed -i '/^#*ls_title=/c\ls_title='"${PRETTY_NAME}" "$INI"
-
-###############################################################################
-# Pre-fill login username (passed via XRDP_USERNAME env var from KVP)
-# Modern xrdp.ini no longer has ls_username — set username= in session sections.
-###############################################################################
-if [ -n "${XRDP_USERNAME:-}" ]; then
-    sed -i 's/^username=ask$/username='"${XRDP_USERNAME}"'/' "$INI"
-    echo "xRDP: pre-filled login username to '${XRDP_USERNAME}'"
-fi
 
 ###############################################################################
 # Login screen colours — clean light dialog on dark outer background

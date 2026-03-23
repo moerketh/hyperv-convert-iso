@@ -681,6 +681,17 @@ create_automation_user() {
             usermod -aG wheel vmcreate
         fi
 
+        # Ensure vmcreate is in whatever group owns the sudo binary.
+        if [ -x /usr/bin/stat ]; then
+            sudo_gid=$(stat -c %g /usr/bin/sudo 2>/dev/null)
+            if [ -n "$sudo_gid" ] && [ "$sudo_gid" != "0" ]; then
+                sudo_group=$(getent group "$sudo_gid" 2>/dev/null | cut -d: -f1)
+                if [ -n "$sudo_group" ]; then
+                    usermod -aG "$sudo_group" vmcreate
+                fi
+            fi
+        fi
+
         mkdir -p /etc/sudoers.d
         echo "vmcreate ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/vmcreate
         chmod 0440 /etc/sudoers.d/vmcreate
@@ -720,6 +731,266 @@ capture_ssh_state() {
         touch "$root/var/lib/vmcreate/.ssh_was_disabled"
         echo "SSH was not enabled — marked for post-boot restore"
     fi
+}
+
+# ── Tor SOCKS proxy for apt-transport-tor ────────────────────────────
+# Some distros route all APT traffic through Tor (tor+https://
+# transport).  The chroot shares the ISO's network namespace, so if we
+# start a Tor daemon on the ISO it makes 127.0.0.1:9050 available inside
+# the chroot transparently.  These functions are no-ops when the target
+# disk has no tor+ APT sources.
+
+# Global flag so stop_tor_if_running knows whether we started it.
+_VMCREATE_TOR_STARTED=false
+
+# Check whether the target root filesystem uses tor+https:// or tor+http://
+# in any APT source file.  Returns 0 (true) if tor sources are found.
+# Usage: _has_tor_apt_sources /mnt/new
+_has_tor_apt_sources() {
+    local root="$1"
+    [ -d "$root/etc/apt" ] || return 1
+    # .list files: lines starting with deb or deb-src
+    if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/"*.list 2>/dev/null; then
+        return 0
+    fi
+    # DEB822 .sources files: URIs: field
+    if grep -rqs 'tor+https\?://' "$root/etc/apt/sources.list.d/"*.sources 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Start Tor on the live ISO if the target disk uses tor+ APT sources.
+# Waits for the SOCKS proxy to accept connections (up to 60s for circuit build).
+# Usage: start_tor_if_needed /mnt/new
+start_tor_if_needed() {
+    local root="$1"
+    if ! _has_tor_apt_sources "$root"; then
+        return 0
+    fi
+    echo "Detected tor+https APT sources — starting Tor daemon on ISO"
+    # Start tor in the background (ISO's own tor binary, not the chroot's)
+    tor --runasdaemon 1 --SocksPort 9050 --DataDirectory /tmp/tor-data --Log "notice stdout" 2>&1 | head -5 &
+    # Wait for the SOCKS port to accept connections
+    local elapsed=0
+    while [ $elapsed -lt 60 ]; do
+        if (echo > /dev/tcp/127.0.0.1/9050) 2>/dev/null; then
+            echo "Tor SOCKS proxy ready after ${elapsed}s"
+            _VMCREATE_TOR_STARTED=true
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+        if (( elapsed % 10 == 0 )); then
+            echo "Waiting for Tor to bootstrap... ${elapsed}s"
+        fi
+    done
+    echo "WARNING: Tor did not bootstrap within 60s — apt-transport-tor may fail"
+    _VMCREATE_TOR_STARTED=true
+    return 0
+}
+
+# Stop the Tor daemon if we started it.
+# Usage: stop_tor_if_running
+stop_tor_if_running() {
+    if [ "$_VMCREATE_TOR_STARTED" = "true" ]; then
+        echo "Stopping Tor daemon"
+        pkill -x tor 2>/dev/null || true
+        _VMCREATE_TOR_STARTED=false
+    fi
+}
+
+# ── Configure temporary second NIC for post-boot SSH ─────────────────
+# When a guest uses ifupdown with only static interface configs and no
+# higher-level network manager (netplan / NetworkManager / systemd-networkd),
+# a hot-added Hyper-V NIC won't get an IP automatically.  Additionally,
+# guests with restrictive firewalls may block DHCP and SSH traffic.
+#
+# VMCreate adds a temporary second NIC ("VMCreate Temp") on the Default
+# Switch for post-boot SSH.  This function:
+#   1. Writes DHCP config for eth1 via interfaces.d (belt-and-suspenders)
+#   2. Installs a systemd oneshot service that:
+#      a. Opens firewall rules on eth1 only (nft/iptables if present)
+#      b. Brings up eth1 and obtains a DHCP lease
+#   3. Writes a self-contained cleanup script that the C# post-boot step
+#      executes — no hardcoded paths in C#.
+# Usage: configure_temp_nic /mnt/new
+
+# Returns 0 if the guest needs explicit DHCP config for new NICs.
+_needs_temp_nic() {
+    local root="$1"
+    local ifaces="$root/etc/network/interfaces"
+    local ifaces_d="$root/etc/network/interfaces.d"
+
+    # Must use ifupdown
+    [ -f "$ifaces" ] || return 1
+
+    # Must have at least one static interface (check main file + interfaces.d/)
+    # Anchor to 'iface' keyword to skip commented-out lines (e.g. #iface eth0 inet dhcp)
+    grep -rqE '^\s*iface\s+\S+\s+inet\s+static' "$ifaces" "$ifaces_d" 2>/dev/null || return 1
+
+    # If any interface already uses DHCP, the stack can handle new NICs
+    grep -rqE '^\s*iface\s+\S+\s+inet\s+dhcp' "$ifaces" "$ifaces_d" 2>/dev/null && return 1
+
+    # Skip if a higher-level network manager is present
+    ls "$root/etc/netplan/"*.yaml >/dev/null 2>&1 && return 1
+    [ -d "$root/etc/NetworkManager/system-connections" ] && \
+        [ "$(ls -A "$root/etc/NetworkManager/system-connections/" 2>/dev/null)" ] && return 1
+    ls "$root/etc/systemd/network/"*.network >/dev/null 2>&1 && return 1
+
+    return 0
+}
+
+configure_temp_nic() {
+    local root="$1"
+    _needs_temp_nic "$root" || return 0
+    echo "Static-only ifupdown networking detected — configuring temporary NIC (eth1)"
+
+    # ── 1. interfaces.d fallback (works if no firewall blocks DHCP) ──
+    local ifaces="$root/etc/network/interfaces"
+    if [ -f "$ifaces" ]; then
+        if ! grep -q 'source /etc/network/interfaces.d/' "$ifaces" && \
+           ! grep -q 'source-directory /etc/network/interfaces.d' "$ifaces"; then
+            echo "" >> "$ifaces"
+            echo "source /etc/network/interfaces.d/*" >> "$ifaces"
+            echo "Added interfaces.d source line to $ifaces"
+        fi
+    fi
+
+    mkdir -p "$root/etc/network/interfaces.d"
+    cat > "$root/etc/network/interfaces.d/vmcreate-temp-dhcp" <<'EOF'
+# Temporary VMCreate override — DHCP on the second Hyper-V NIC for post-boot SSH.
+# Removed automatically after post-boot completes.
+auto eth1
+iface eth1 inet dhcp
+EOF
+    echo "Created /etc/network/interfaces.d/vmcreate-temp-dhcp"
+
+    # ── 1b. Ensure a DHCP client is available ────────────────────────
+    if ! chroot "$root" sh -c 'command -v dhclient >/dev/null 2>&1 || command -v dhcpcd >/dev/null 2>&1 || command -v udhcpc >/dev/null 2>&1'; then
+        echo "No DHCP client found — installing isc-dhcp-client"
+        chroot "$root" apt-get update -qq 2>&1 || true
+        chroot "$root" apt-get install -y -qq isc-dhcp-client 2>&1 || echo "WARNING: failed to install isc-dhcp-client"
+    fi
+
+    # ── 2. systemd oneshot: open firewall for eth1 + DHCP ──────────
+    mkdir -p "$root/usr/local/bin"
+    cat > "$root/usr/local/bin/vmcreate-temp-net.sh" <<'SCRIPT'
+#!/bin/bash
+# VMCreate: open firewall for eth1 and obtain DHCP lease.
+# Runs AFTER the distro firewall has finished loading (After=network.target),
+# so nft/iptables insert puts our rules at the top of the already-populated
+# chains.  Rules are scoped to eth1 only — other interfaces are untouched.
+#
+# Both nft and iptables sections run unconditionally (not elif) because
+# Debian systems often ship both binaries.  nft tries both the native
+# "inet filter" table and the iptables-nft translated "ip filter" table.
+set -e
+
+# Kill any stale DHCP client from a previous failed attempt (e.g. ifupdown)
+pkill -f 'dhclient.*eth1' || true
+pkill -f 'dhcpcd.*eth1' || true
+sleep 1
+
+ip link show eth1 || true
+
+# ── nft rules (try both table families) ──────────────────────────────
+if command -v nft >/dev/null 2>&1; then
+    # Native nftables table (inet family)
+    nft insert rule inet filter input  iifname "eth1" counter accept 2>/dev/null || true
+    nft insert rule inet filter output oifname "eth1" counter accept 2>/dev/null || true
+    # iptables-nft translated table (ip family)
+    nft insert rule ip filter INPUT  iifname "eth1" counter accept 2>/dev/null || true
+    nft insert rule ip filter OUTPUT oifname "eth1" counter accept 2>/dev/null || true
+fi
+
+# ── iptables rules (always, not elif) ────────────────────────────────
+if command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT  -i eth1 -j ACCEPT || true
+    iptables -I OUTPUT -o eth1 -j ACCEPT || true
+fi
+
+ip link set eth1 up || true
+if command -v dhclient >/dev/null 2>&1; then
+    dhclient -1 eth1 || true
+elif command -v dhcpcd >/dev/null 2>&1; then
+    dhcpcd -1 eth1 || true
+elif command -v udhcpc >/dev/null 2>&1; then
+    udhcpc -i eth1 -n -q || true
+else
+    ifup eth1 2>/dev/null || true
+fi
+SCRIPT
+    chmod 755 "$root/usr/local/bin/vmcreate-temp-net.sh"
+    echo "Created /usr/local/bin/vmcreate-temp-net.sh"
+
+    mkdir -p "$root/etc/systemd/system"
+    cat > "$root/etc/systemd/system/vmcreate-temp-net.service" <<'UNIT'
+[Unit]
+Description=VMCreate temporary NIC setup (firewall + DHCP on eth1)
+After=network.target
+Before=ssh.service sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/vmcreate-temp-net.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    echo "Created /etc/systemd/system/vmcreate-temp-net.service"
+
+    # Enable via symlink (we're in a chroot, can't run systemctl)
+    mkdir -p "$root/etc/systemd/system/multi-user.target.wants"
+    ln -sf /etc/systemd/system/vmcreate-temp-net.service \
+        "$root/etc/systemd/system/multi-user.target.wants/vmcreate-temp-net.service"
+    echo "Enabled vmcreate-temp-net.service"
+
+    # ── 3. Self-contained cleanup script ─────────────────────────────
+    mkdir -p "$root/var/lib/vmcreate"
+    cat > "$root/var/lib/vmcreate/restore_net.sh" <<'CLEANUP'
+#!/bin/bash
+# VMCreate: undo temporary NIC configuration.
+# Executed by CleanupTemporaryNicStep over SSH, then self-deletes.
+set -e
+
+# Disable and remove the systemd service
+systemctl disable vmcreate-temp-net.service 2>/dev/null || true
+rm -f /etc/systemd/system/vmcreate-temp-net.service
+rm -f /etc/systemd/system/multi-user.target.wants/vmcreate-temp-net.service
+rm -f /usr/local/bin/vmcreate-temp-net.sh
+
+# Remove interfaces.d DHCP config
+rm -f /etc/network/interfaces.d/vmcreate-temp-dhcp
+
+# Remove firewall rules for eth1 (try both nft families + iptables)
+if command -v nft >/dev/null 2>&1; then
+    for family_table in "inet filter" "ip filter"; do
+        for chain in input output INPUT OUTPUT; do
+            iface_key="eth1"
+            case "$chain" in input|INPUT) field="iifname" ;; *) field="oifname" ;; esac
+            handle=$(nft -a list chain $family_table "$chain" 2>/dev/null \
+                | grep "$field \"$iface_key\"" \
+                | grep -oP 'handle \K[0-9]+' | head -1) || true
+            [ -n "$handle" ] && nft delete rule $family_table "$chain" handle "$handle" 2>/dev/null || true
+        done
+    done
+fi
+if command -v iptables >/dev/null 2>&1; then
+    iptables -D INPUT -i eth1 -j ACCEPT 2>/dev/null || true
+    iptables -D OUTPUT -o eth1 -j ACCEPT 2>/dev/null || true
+fi
+
+# Bring down eth1
+ip link set eth1 down 2>/dev/null || true
+
+# Self-delete
+rm -f /var/lib/vmcreate/restore_net.sh
+echo 'Temporary NIC configuration removed'
+CLEANUP
+    chmod 755 "$root/var/lib/vmcreate/restore_net.sh"
+    echo "Created cleanup script /var/lib/vmcreate/restore_net.sh"
 }
 
 # Remove conflicting apt sources that prevent apt-get update from working.
@@ -819,7 +1090,9 @@ generate_ssh_host_keys() {
     local root="$1"
     if ! ls "$root/etc/ssh/ssh_host_"*"_key" >/dev/null 2>&1; then
         echo "No SSH host keys found — generating"
-        chroot "$root" ssh-keygen -A
+        if ! chroot "$root" ssh-keygen -A 2>&1; then
+            echo "WARNING: ssh-keygen not available in chroot — skipping host key generation"
+        fi
     fi
 }
 

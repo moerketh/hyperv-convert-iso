@@ -99,7 +99,7 @@ Hyper-V Key-Value Pair (KVP) exchange uses VMBus to pass data between host and g
 
 | Direction | Pool File | Used For |
 |-----------|-----------|----------|
-| Host → Guest | `.kvp_pool_0` | Configuration flags (`VMCREATE_MODE`, `VMCREATE_XRDP`, `VMCREATE_XRDP_USERNAME`, `VMCREATE_SSH_PUBKEY`, `VMCREATE_DEBUG`) |
+| Host → Guest | `.kvp_pool_0` | Configuration flags (`VMCREATE_MODE`, `VMCREATE_XRDP`, `VMCREATE_SSH_PUBKEY`, `VMCREATE_DEBUG`) |
 | Guest → Host | `.kvp_pool_1` | Progress reporting (`WorkflowProgress`, `PartcloneProgress`) |
 
 ### Host Side (C# / WMI)

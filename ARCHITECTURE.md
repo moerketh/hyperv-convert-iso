@@ -156,7 +156,6 @@ The system follows a deterministic boot sequence from ISO initialization to clea
 - **Operations**:
   - Multi-distro package installation (apt, dnf, pacman, zypper)
   - vsock transport configuration for Hyper-V Enhanced Session
-  - Username pre-fill via `XRDP_USERNAME` environment variable
 
 #### autorun/install_pwsh.sh (PowerShell)
 - **Purpose**: Installs PowerShell on the target VM for post-boot configuration
@@ -224,7 +223,6 @@ Total: 2560 bytes per record
 |-----|---------|--------------|---------|
 | `VMCREATE_MODE` | Workflow selection | "customize"/"" | "customize" |
 | `VMCREATE_XRDP` | XRDP installation flag | "true"/"false" | "true" |
-| `VMCREATE_XRDP_USERNAME` | Username to pre-fill in xRDP login | username string | "admin" |
 | `VMCREATE_SSH_PUBKEY` | SSH public key for automation user | authorized_keys format | "ssh-ed25519 AAAA..." |
 | `VMCREATE_DEBUG` | Debug mode flag | "true"/"false" | "false" |
 

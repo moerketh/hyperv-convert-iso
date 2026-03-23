@@ -178,6 +178,12 @@ capture_ssh_state /mnt/new
 
 # ── Fix conflicting apt sources ──────────────────────────────────────
 fix_apt_repo_conflicts /mnt/new
+# ── Start Tor if the target uses tor+https APT sources ──────────────
+start_tor_if_needed /mnt/new
+
+# ── Configure temporary second NIC for post-boot SSH ─────────────────
+# Writes firewall rules + DHCP config for eth1; no-op if not needed.
+configure_temp_nic /mnt/new
 
 # ── Hyper-V guest optimization ───────────────────────────────────────
 report_progress "INSTALL_HYPERV_PACKAGES" "Installing Hyper-V guest integration services"
@@ -189,8 +195,10 @@ enable_services_via_symlinks /mnt/new
 # Generate SSH host keys if missing
 generate_ssh_host_keys /mnt/new
 
-# ── Fix netplan: replace hardcoded interface names with match-all ─────
+# ── Fix network configs: replace hardcoded interface names ────────────
 fix_netplan_for_hyperv /mnt/new
+fix_networkmanager_for_hyperv /mnt/new
+fix_interfaces_for_hyperv /mnt/new
 
 # ── Disable cloud-init network override ──────────────────────────────
 disable_cloud_init_network /mnt/new
@@ -200,15 +208,15 @@ XRDP_FLAG=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_XRDP")
 if [ "$XRDP_FLAG" = "true" ]; then
     report_progress "INSTALL_XRDP" "Installing XRDP for Enhanced Session support"
     echo "Installing xrdp for Hyper-V Enhanced Session support"
-    XRDP_USERNAME=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_XRDP_USERNAME")
-    export XRDP_USERNAME
     # Non-fatal: a failed XRDP install should not invalidate a successful customization
-    if chroot /mnt/new /bin/bash -c "XRDP_USERNAME='$XRDP_USERNAME' /opt/autorun/install_xrdp.sh"; then
+    if chroot /mnt/new /bin/bash -c "/opt/autorun/install_xrdp.sh"; then
         echo "XRDP installation completed successfully"
     else
         report_progress "XRDP_WARNING" "XRDP installation failed, VM will boot without XRDP"
         echo "WARNING: XRDP installation failed, continuing..." | tee -a /tmp/error.log
     fi
+    # Safety: remove policy-rc.d in case install_xrdp.sh failed mid-way
+    rm -f /mnt/new/usr/sbin/policy-rc.d
     rm -f /mnt/new/opt/autorun/install_xrdp.sh
 fi
 
@@ -222,6 +230,9 @@ else
     echo "WARNING: PowerShell installation failed, continuing..." | tee -a /tmp/error.log
 fi
 rm -f /mnt/new/opt/autorun/install_pwsh.sh
+
+# ── Stop Tor daemon if we started it ─────────────────────────────────
+stop_tor_if_running
 
 # ── Create automation user and inject SSH key on target VM ───────────
 # Retry for up to 30s — KVP may not have been flushed by hv_kvp_daemon yet.

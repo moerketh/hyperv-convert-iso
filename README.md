@@ -24,6 +24,14 @@ Two modes are supported:
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full workflow.
 
+## Security & Privacy Notice
+
+This ISO modifies network configuration, firewall rules, SSH settings, and boot infrastructure inside the target VM to make it compatible with Hyper-V. VMCreate does its best to restore distribution defaults after customization completes.
+
+**If you depend on the security or privacy features of a distribution (e.g. Whonix, Tails), do not use this toolchain to deploy it.** The modifications may weaken or bypass the protections those distributions are designed to provide.
+
+Many of these distributions were not designed or tested by their creators to run in Hyper-V. Running them in this way may void any warranty or support provided by the distribution maintainers.
+
 ## KVP Parameters
 
 Set automatically by VMCreate:
@@ -32,7 +40,6 @@ Set automatically by VMCreate:
 |------|-------------|
 | `VMCREATE_MODE` | `customize` for Gen2, absent for clone |
 | `VMCREATE_XRDP` | `true` to install xRDP |
-| `VMCREATE_XRDP_USERNAME` | Pre-fill the xRDP login field |
 | `VMCREATE_SSH_PUBKEY` | SSH public key for automation user |
 | `VMCREATE_DEBUG` | `true` to keep VM running after completion |
 
