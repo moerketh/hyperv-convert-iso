@@ -1191,3 +1191,221 @@ disable_cloud_init_network() {
         echo "Disabled cloud-init network config override"
     fi
 }
+
+# ── Install kernel postinst hook for ESP redirect ────────────────────
+# Kernel and GRUB package updates can overwrite the ESP redirect grub.cfg.
+# This hook re-generates the redirect after every kernel install, ensuring
+# the boot chain survives future apt/dnf/pacman upgrades.
+# Usage: install_grub_postinst_hook /mnt/new
+install_grub_postinst_hook() {
+    local root="$1"
+
+    # Determine GRUB directory
+    local grub_dir
+    if [ -d "$root/boot/grub2" ]; then
+        grub_dir="/boot/grub2"
+    else
+        grub_dir="/boot/grub"
+    fi
+
+    # Install the hook script
+    mkdir -p "$root/etc/kernel/postinst.d"
+    cat > "$root/etc/kernel/postinst.d/zz-vmcreate-grub-redirect" <<HOOK
+#!/bin/bash
+# VMCreate: re-apply the ESP redirect grub.cfg after kernel/GRUB updates.
+# Installed by hyperv-convert-iso; safe to remove if no longer needed.
+ROOT_UUID=\$(findmnt -n -o UUID / 2>/dev/null || blkid -s UUID -o value \$(findmnt -n -o SOURCE / 2>/dev/null) 2>/dev/null)
+[ -z "\$ROOT_UUID" ] && exit 0
+GRUB_DIR="$grub_dir"
+for dir in /boot/efi/EFI/BOOT "/boot/efi\${GRUB_DIR}"; do
+    mkdir -p "\$dir"
+    cat > "\$dir/grub.cfg" <<EOF
+search.fs_uuid \${ROOT_UUID} root
+set prefix=(\\\$root)\${GRUB_DIR}
+configfile \\\$prefix/grub.cfg
+EOF
+done
+HOOK
+    chmod 755 "$root/etc/kernel/postinst.d/zz-vmcreate-grub-redirect"
+    echo "Installed kernel postinst hook: zz-vmcreate-grub-redirect"
+
+    # Also install for dracut/mkinitcpio-based distros that use kernel-install
+    if [ -d "$root/etc/kernel/install.d" ] || [ -d "$root/usr/lib/kernel/install.d" ]; then
+        local install_d="$root/etc/kernel/install.d"
+        mkdir -p "$install_d"
+        cp "$root/etc/kernel/postinst.d/zz-vmcreate-grub-redirect" \
+            "$install_d/99-vmcreate-grub-redirect.install"
+        chmod 755 "$install_d/99-vmcreate-grub-redirect.install"
+        echo "Installed kernel-install hook: 99-vmcreate-grub-redirect.install"
+    fi
+}
+
+# ── Create a swap file on the new root ───────────────────────────────
+# The old MBR disk may have had a swap partition that was removed during
+# the GPT conversion.  Rather than leaving the VM without swap (which
+# can cause OOM issues and break hibernation/upgrade assumptions), create
+# a 2 GB swap file on the new root partition.
+# Usage: create_swap_file /mnt/new
+create_swap_file() {
+    local root="$1"
+    local swap_size_mb="${2:-2048}"
+    local swapfile="$root/swapfile"
+
+    if [ -f "$swapfile" ]; then
+        echo "Swap file already exists at $swapfile — skipping"
+        return 0
+    fi
+
+    echo "Creating ${swap_size_mb}MB swap file..."
+    dd if=/dev/zero of="$swapfile" bs=1M count="$swap_size_mb" status=progress 2>&1 || {
+        # fallocate is faster but not supported on all filesystems
+        rm -f "$swapfile"
+        echo "WARNING: Failed to create swap file (non-fatal)"
+        return 0
+    }
+    chmod 600 "$swapfile"
+    mkswap "$swapfile" 2>&1
+    echo "Created ${swap_size_mb}MB swap file"
+
+    # Add to fstab if not already present
+    local fstab="$root/etc/fstab"
+    if [ -f "$fstab" ] && ! grep -q '/swapfile' "$fstab"; then
+        echo "/swapfile none swap sw 0 0" >> "$fstab"
+        echo "Added swap file entry to fstab"
+    fi
+}
+
+# ── Select the correct partclone tool for the detected filesystem ────
+# Returns the partclone binary name for the given filesystem type.
+# Usage: tool=$(select_partclone_tool "ext4")
+select_partclone_tool() {
+    local fs_type="$1"
+    case "$fs_type" in
+        ext2)           echo "partclone.ext2" ;;
+        ext3)           echo "partclone.ext3" ;;
+        ext4)           echo "partclone.ext4" ;;
+        btrfs)          echo "partclone.btrfs" ;;
+        xfs)            echo "partclone.xfs" ;;
+        *)
+            echo ""
+            return 1
+            ;;
+    esac
+}
+
+# ── Resize filesystem to fill partition after clone ──────────────────
+# partclone creates a bit-for-bit copy, so if the new partition is larger
+# than the old one, the extra space is unused.  This function expands the
+# filesystem to fill the entire partition.
+# Usage: resize_cloned_filesystem /dev/sda2 ext4
+resize_cloned_filesystem() {
+    local partition="$1"
+    local fs_type="$2"
+
+    echo "Resizing $fs_type filesystem on $partition to fill partition..."
+    case "$fs_type" in
+        ext2|ext3|ext4)
+            e2fsck -f -y "$partition" 2>&1 || true
+            resize2fs "$partition" 2>&1
+            echo "ext filesystem resized successfully"
+            ;;
+        xfs)
+            # XFS can only be resized while mounted
+            local tmp_mount="/tmp/xfs_resize_$$"
+            mkdir -p "$tmp_mount"
+            mount "$partition" "$tmp_mount"
+            xfs_growfs "$tmp_mount" 2>&1
+            umount "$tmp_mount"
+            rmdir "$tmp_mount"
+            echo "XFS filesystem resized successfully"
+            ;;
+        btrfs)
+            # btrfs can only be resized while mounted
+            local tmp_mount="/tmp/btrfs_resize_$$"
+            mkdir -p "$tmp_mount"
+            mount "$partition" "$tmp_mount"
+            btrfs filesystem resize max "$tmp_mount" 2>&1
+            umount "$tmp_mount"
+            rmdir "$tmp_mount"
+            echo "btrfs filesystem resized successfully"
+            ;;
+        *)
+            echo "WARNING: Don't know how to resize $fs_type — skipping"
+            ;;
+    esac
+}
+
+# ── Validate fstab for stale references ──────────────────────────────
+# After update_fstab, check that no entries still reference the old disk's
+# UUIDs.  This catches entries for partitions that weren't explicitly
+# rewritten (e.g. data partitions, LVM, extra mounts).
+# Usage: validate_fstab /mnt/new/etc/fstab /dev/sdb
+validate_fstab() {
+    local fstab_path="$1"
+    local old_disk="$2"
+    local warnings=0
+
+    [ -f "$fstab_path" ] || return 0
+
+    # Collect all UUIDs from the old disk's partitions
+    local old_uuids
+    old_uuids=$(blkid -o value -s UUID "$old_disk"* 2>/dev/null | sort -u)
+
+    for uuid in $old_uuids; do
+        if grep -q "$uuid" "$fstab_path"; then
+            echo "WARNING: fstab still references old disk UUID $uuid"
+            send_kvp "FstabWarning" "Stale UUID: $uuid" 2>/dev/null || true
+            warnings=$((warnings + 1))
+        fi
+    done
+
+    # Check for device-path references to common old disk patterns
+    if grep -qE "^/dev/sd[a-z][0-9]" "$fstab_path"; then
+        echo "WARNING: fstab contains device-path entries that may not survive disk reordering"
+        warnings=$((warnings + 1))
+    fi
+
+    if [ "$warnings" -eq 0 ]; then
+        echo "fstab validation PASSED — no stale references found"
+    else
+        echo "fstab validation completed with $warnings warning(s)"
+    fi
+
+    return 0
+}
+
+# ── Force Hyper-V modules into initramfs ─────────────────────────────
+# Ensures hv_vmbus, hv_storvsc, hv_netvsc, and hv_utils are included in
+# the initramfs regardless of the distro's module auto-detection.  Without
+# these, the VM may fail to find the root disk after a kernel upgrade.
+# Usage: ensure_hyperv_initramfs_modules /mnt/new
+ensure_hyperv_initramfs_modules() {
+    local root="$1"
+    local modules="hv_vmbus hv_storvsc hv_netvsc hv_utils"
+
+    echo "Ensuring Hyper-V modules are included in initramfs..."
+
+    # initramfs-tools (Debian/Ubuntu)
+    if [ -f "$root/etc/initramfs-tools/modules" ]; then
+        for mod in $modules; do
+            if ! grep -q "^${mod}$" "$root/etc/initramfs-tools/modules"; then
+                echo "$mod" >> "$root/etc/initramfs-tools/modules"
+                echo "Added $mod to initramfs-tools modules"
+            fi
+        done
+    fi
+
+    # dracut (Fedora/RHEL/SUSE)
+    if [ -d "$root/etc/dracut.conf.d" ]; then
+        echo "add_drivers+=\" $modules \"" \
+            > "$root/etc/dracut.conf.d/hyperv.conf"
+        echo "Created dracut hyperv.conf with modules: $modules"
+    fi
+
+    # mkinitcpio (Arch)
+    if [ -d "$root/etc/mkinitcpio.conf.d" ]; then
+        echo "MODULES=($modules)" \
+            > "$root/etc/mkinitcpio.conf.d/hyperv.conf"
+        echo "Created mkinitcpio hyperv.conf with modules: $modules"
+    fi
+}

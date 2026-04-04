@@ -95,22 +95,32 @@ echo "Detecting partitions on $old_disk" | tee -a /tmp/clone.log
 
 detect_partitions "$old_disk"
 
+# Detect root filesystem type for correct partclone tool selection
+root_fs_type=$(blkid -o value -s TYPE "$root_part" 2>/dev/null || echo "ext4")
+echo "Root filesystem type: $root_fs_type"
+clone_tool=$(select_partclone_tool "$root_fs_type")
+if [ -z "$clone_tool" ]; then
+    echo "ERROR: Unsupported root filesystem type: $root_fs_type" | tee -a /tmp/error.log
+    exit 1
+fi
+echo "Selected clone tool: $clone_tool"
+
 # Format new ESP partition (only needed if no source ESP to clone, but partclone
 # will overwrite it if there is one — cheap to do unconditionally for vfat)
 mkfs.vfat -F32 "${new_disk}1"
 
 # Only format root if partclone will NOT overwrite it (shouldn't happen, but guard)
-# partclone.ext4 --dev-to-dev overwrites the partition, so skip mkfs.ext4
+# partclone --dev-to-dev overwrites the partition, so skip mkfs
 
 # Clone root
 report_progress "CLONE_ROOT" "Starting root partition cloning"
-echo "Cloning root from $root_part to ${new_disk}2"
+echo "Cloning root from $root_part to ${new_disk}2 using $clone_tool"
 
 
 
 # Run partclone in background with logfile
 # Use a named pipe so we can capture partclone's exit code directly
-partclone.ext4 --force --dev-to-dev --source "$root_part" --output "${new_disk}2" --logfile /tmp/partclone.log 2>&1 | tee -a /tmp/partclone_process.log &
+$clone_tool --force --dev-to-dev --source "$root_part" --output "${new_disk}2" --logfile /tmp/partclone.log 2>&1 | tee -a /tmp/partclone_process.log &
 clone_pipeline_pid=$!
 
 while kill -0 $clone_pipeline_pid 2>/dev/null; do
@@ -157,7 +167,7 @@ wait $clone_pipeline_pid
 clone_exit=$?
 if [ $clone_exit -ne 0 ]; then
     report_progress "CLONE_ERROR" "Root partition cloning failed with exit code $clone_exit"
-    echo "ERROR: partclone.ext4 failed with exit code $clone_exit" | tee -a /tmp/error.log
+    echo "ERROR: $clone_tool failed with exit code $clone_exit" | tee -a /tmp/error.log
     exit 1
 fi
 
@@ -189,6 +199,10 @@ else
     exit 1
 fi
 
+# Resize root filesystem to fill the new (potentially larger) partition
+report_progress "RESIZE" "Resizing root filesystem to fill partition"
+resize_cloned_filesystem "${new_disk}2" "$root_fs_type"
+
 # Mount new root and ESP
 mkdir -p /mnt/new
 retry 3 1 mount ${new_disk}2 /mnt/new
@@ -210,6 +224,13 @@ fi
 # Update fstab with new UUIDs
 report_progress "UPDATE_FSTAB" "Updating fstab with new UUIDs"
 update_fstab "/mnt/new/etc/fstab" "$root_part" "${new_disk}1" "${new_disk}2"
+
+# Validate fstab for stale references to old disk
+validate_fstab "/mnt/new/etc/fstab" "$old_disk"
+
+# Create swap file to replace the removed swap partition
+report_progress "CREATE_SWAP" "Creating swap file"
+create_swap_file /mnt/new
 
 # Bind mounts for chroot
 mount --bind /dev /mnt/new/dev
@@ -243,7 +264,18 @@ fi
 if [ -f /mnt/new/etc/default/grub ]; then
     sed -i 's/resume=UUID=[^ ]*/noresume/g; s/resume=\/dev\/[^ ]*/noresume/g' /mnt/new/etc/default/grub
 fi
-# Regenerate initramfs so the resume hook picks up the change
+
+# ── Install kernel postinst hook for ESP redirect ────────────────────
+# This hook re-generates the ESP redirect grub.cfg after every kernel
+# install, ensuring the boot chain survives future package upgrades.
+install_grub_postinst_hook /mnt/new
+
+# ── Force Hyper-V modules into initramfs ─────────────────────────────
+# Ensure hv_vmbus, hv_storvsc, hv_netvsc, hv_utils are included so the
+# VM can find its root disk after kernel upgrades.
+ensure_hyperv_initramfs_modules /mnt/new
+
+# Regenerate initramfs so the resume hook and Hyper-V modules take effect
 if chroot /mnt/new /bin/bash -c 'command -v update-initramfs >/dev/null 2>&1'; then
     echo "Regenerating initramfs..."
     chroot /mnt/new update-initramfs -u -k all 2>&1 || echo "WARNING: update-initramfs failed (non-fatal)"
@@ -354,9 +386,21 @@ else
 fi
 _root_uuid=$(blkid -o value -s UUID "${new_disk}2" 2>/dev/null || true)
 if [ -n "$_root_uuid" ]; then
+    # Discover the distro-specific EFI directory from install_grub.sh output
+    # (it writes to EFI/<distro_id>/ via --bootloader-id)
+    _distro_efi_dirs=""
+    for _candidate in /mnt/new/boot/efi/EFI/*/; do
+        _base=$(basename "$_candidate")
+        # Skip known generic dirs — add the rest as distro-specific
+        case "$_base" in
+            BOOT|GRUB) continue ;;
+            *) _distro_efi_dirs="$_distro_efi_dirs $_candidate" ;;
+        esac
+    done
+
     # The critical path: GRUB looks here based on its embedded prefix
-    # Also write to EFI standard directories as fallback
-    for _dir in "/mnt/new/boot/efi${_grub_dir}" /mnt/new/boot/efi/EFI/BOOT /mnt/new/boot/efi/EFI/ubuntu /mnt/new/boot/efi/EFI/GRUB; do
+    # Also write to EFI standard directories and distro-specific directories
+    for _dir in "/mnt/new/boot/efi${_grub_dir}" /mnt/new/boot/efi/EFI/BOOT /mnt/new/boot/efi/EFI/GRUB $_distro_efi_dirs; do
         mkdir -p "$_dir"
         cat > "$_dir/grub.cfg" <<GRUBCFG
 search.fs_uuid ${_root_uuid} root

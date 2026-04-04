@@ -12,6 +12,31 @@ is_debian() { [ "$ID" = "debian" ] || [ "$ID" = "ubuntu" ] || [[ "${ID_LIKE:-}" 
 is_fedora() { [ "$ID" = "fedora" ] || [[ "${ID_LIKE:-}" =~ fedora ]]; }
 is_suse() { [ "$ID" = "opensuse-tumbleweed" ] || [ "$ID" = "opensuse-leap" ] || [[ "${ID_LIKE:-}" =~ suse ]]; }
 
+# ── Determine distro-specific EFI bootloader ID ─────────────────────
+# Kernel postinst hooks (e.g. zz-update-grub) write to EFI/<distro_id>/,
+# so we install GRUB there as well as the removable fallback path.
+distro_boot_id() {
+    case "$ID" in
+        ubuntu)                     echo "ubuntu" ;;
+        kali)                       echo "kali" ;;
+        parrot)                     echo "parrot" ;;
+        debian)                     echo "debian" ;;
+        fedora)                     echo "fedora" ;;
+        opensuse-tumbleweed|opensuse-leap) echo "opensuse" ;;
+        arch)                       echo "arch" ;;
+        *)
+            if [[ "${ID_LIKE:-}" =~ debian ]]; then echo "debian"
+            elif [[ "${ID_LIKE:-}" =~ fedora ]]; then echo "fedora"
+            elif [[ "${ID_LIKE:-}" =~ arch ]]; then echo "arch"
+            elif [[ "${ID_LIKE:-}" =~ suse ]]; then echo "opensuse"
+            else echo "GRUB"
+            fi
+            ;;
+    esac
+}
+
+DISTRO_BOOT_ID=$(distro_boot_id)
+
 if is_arch; then
   # Remove deprecated repositories with a single sed command
   sed -i '/^\[\(community\|community-testing\|testing\|testing-debug\|staging\|staging-debug\)\]$/,/^\[/ { /^\[/!d; /^\[\(community\|community-testing\|testing\|testing-debug\|staging\|staging-debug\)\]$/d }' /etc/pacman.conf
@@ -27,6 +52,9 @@ if is_arch; then
   echo 'Pacman install grub'
   pacman -S --noconfirm grub efibootmgr os-prober
   export PATH=$PATH:/usr/sbin:/sbin
+  # Primary: distro-standard path (where kernel postinst hooks write)
+  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="$DISTRO_BOOT_ID" "$new_disk"
+  # Fallback: removable media path (Hyper-V firmware always finds this)
   grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   grub-mkconfig -o /boot/grub/grub.cfg
 elif is_debian; then
@@ -55,16 +83,29 @@ elif is_debian; then
   fi
 
   export PATH=$PATH:/usr/sbin:/sbin
+  # Primary: distro-standard path (where kernel postinst hooks write)
+  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="$DISTRO_BOOT_ID" "$new_disk"
+  # Fallback: removable media path (Hyper-V firmware always finds this)
   grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   update-grub
+
+  # ── Pin GRUB packages to prevent dpkg triggers from overwriting ESP ──
+  apt-mark hold grub-efi-amd64-signed shim-signed 2>/dev/null || true
+  echo "Held grub-efi-amd64-signed and shim-signed to prevent trigger overwrites"
 elif is_fedora; then
   dnf install -y grub2-efi-x64 grub2-efi-x64-modules efibootmgr shim-x64
   export PATH=$PATH:/usr/sbin:/sbin
+  # Primary: distro-standard path
+  grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="$DISTRO_BOOT_ID" "$new_disk"
+  # Fallback: removable media path
   grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   grub2-mkconfig -o /boot/grub2/grub.cfg
 elif is_suse; then
   zypper install -y grub2-x86_64-efi efibootmgr shim
   export PATH=$PATH:/usr/sbin:/sbin
+  # Primary: distro-standard path
+  grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="$DISTRO_BOOT_ID" "$new_disk"
+  # Fallback: removable media path
   grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable "$new_disk"
   grub2-mkconfig -o /boot/grub2/grub.cfg
 else
