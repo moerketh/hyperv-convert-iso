@@ -629,8 +629,12 @@ EOF
 # Many distros (Arch, Fedora, NixOS) use a symlink for /etc/resolv.conf
 # that points into /run/systemd/resolve/ which doesn't exist inside
 # the ISO.  A bind-mount over a dangling symlink fails silently,
-# leaving the chroot without DNS.  This function removes the symlink
-# (if any), then writes the live ISO's resolv.conf into the target.
+# leaving the chroot without DNS.
+#
+# The host can pass nameservers via the VMCREATE_NAMESERVERS KVP
+# (comma-separated IPs, e.g. "192.168.1.1,10.0.0.1").  When present,
+# those are written directly.  Otherwise, the running ISO's
+# resolv.conf is copied as a fallback.
 setup_chroot_dns() {
     local target="$1/etc/resolv.conf"
     # Remove dangling symlink so we can write a real file
@@ -638,12 +642,25 @@ setup_chroot_dns() {
         rm -f "$target"
         echo "Removed dangling resolv.conf symlink in chroot"
     fi
-    # Copy the running ISO's resolv.conf (which has working DNS)
+
+    # Try host-supplied nameservers via KVP first
+    local kvp_ns
+    kvp_ns=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_NAMESERVERS")
+    if [ -n "$kvp_ns" ]; then
+        # Parse comma-separated IPs into individual nameserver lines
+        : > "$target"
+        IFS=',' read -ra ns_list <<< "$kvp_ns"
+        for ns in "${ns_list[@]}"; do
+            ns=$(echo "$ns" | tr -d '[:space:]')
+            [ -n "$ns" ] && printf 'nameserver %s\n' "$ns" >> "$target"
+        done
+        echo "Configured DNS in chroot from KVP: $(cat "$target")"
+        return
+    fi
+
+    # Fallback: copy the running ISO's resolv.conf (which has working DNS)
     if [ -f /etc/resolv.conf ] && [ -s /etc/resolv.conf ]; then
         cp -L /etc/resolv.conf "$target"
-    else
-        # Fallback: write a basic DNS config
-        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$target"
     fi
     echo "Configured DNS in chroot: $(cat "$target")"
 }
