@@ -1257,15 +1257,15 @@ HOOK
     fi
 }
 
-# ── Create a swap file on the new root ───────────────────────────────
-# The old MBR disk may have had a swap partition that was removed during
-# the GPT conversion.  Rather than leaving the VM without swap (which
-# can cause OOM issues and break hibernation/upgrade assumptions), create
-# a 2 GB swap file on the new root partition.
-# Usage: create_swap_file /mnt/new
+# ── Create a swap file on the target root ────────────────────────────
+# Many Linux gallery images ship without swap. Running containers or
+# security tooling can exhaust RAM and hang the VM, so we create a swap
+# file by default. The size can be overridden via the VMCREATE_SWAP_MB
+# KVP key; if omitted, 8192 MB is used.
+# Usage: create_swap_file /mnt/new [size_in_mb]
 create_swap_file() {
-    local root="$1"
-    local swap_size_mb="${2:-2048}"
+    local root="${1:-/mnt/new}"
+    local swap_size_mb="${2:-8192}"
     local swapfile="$root/swapfile"
 
     if [ -f "$swapfile" ]; then
@@ -1273,13 +1273,28 @@ create_swap_file() {
         return 0
     fi
 
-    echo "Creating ${swap_size_mb}MB swap file..."
-    dd if=/dev/zero of="$swapfile" bs=1M count="$swap_size_mb" status=progress 2>&1 || {
-        # fallocate is faster but not supported on all filesystems
-        rm -f "$swapfile"
-        echo "WARNING: Failed to create swap file (non-fatal)"
+    # Ensure enough free space on the root filesystem (swap + 1 GB headroom)
+    local available_mb required_mb
+    available_mb=$(df -BM --output=avail "$root" 2>/dev/null | tail -n 1 | tr -d 'M')
+    required_mb=$((swap_size_mb + 1024))
+
+    if [ -z "$available_mb" ] || [ "$available_mb" -lt "$required_mb" ]; then
+        echo "WARNING: Not enough free space for ${swap_size_mb}MB swap file ($available_mb MB available, $required_mb MB required). Skipping." | tee -a /tmp/error.log
         return 0
-    }
+    fi
+
+    echo "Creating ${swap_size_mb}MB swap file..."
+    if fallocate -l "${swap_size_mb}M" "$swapfile" 2>/dev/null; then
+        echo "Allocated ${swap_size_mb}MB swap file with fallocate"
+    else
+        echo "fallocate failed; falling back to dd..."
+        if ! dd if=/dev/zero of="$swapfile" bs=1M count="$swap_size_mb" status=progress 2>&1; then
+            rm -f "$swapfile"
+            echo "WARNING: Failed to create swap file (non-fatal)" | tee -a /tmp/error.log
+            return 0
+        fi
+    fi
+
     chmod 600 "$swapfile"
     mkswap "$swapfile" 2>&1
     echo "Created ${swap_size_mb}MB swap file"

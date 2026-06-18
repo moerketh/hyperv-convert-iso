@@ -230,7 +230,8 @@ validate_fstab "/mnt/new/etc/fstab" "$old_disk"
 
 # Create swap file to replace the removed swap partition
 report_progress "CREATE_SWAP" "Creating swap file"
-create_swap_file /mnt/new
+VMCREATE_SWAP_MB=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_SWAP_MB")
+create_swap_file /mnt/new "${VMCREATE_SWAP_MB:-8192}"
 
 # Bind mounts for chroot
 mount --bind /dev /mnt/new/dev

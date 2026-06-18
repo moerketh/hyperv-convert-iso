@@ -159,6 +159,11 @@ mount_fstab_extras() {
 }
 mount_fstab_extras
 
+# ── Create swap file (most GPT gallery images ship without swap) ───────
+report_progress "CREATE_SWAP" "Creating swap file"
+VMCREATE_SWAP_MB=$(read_kvp_value "/var/lib/hyperv/.kvp_pool_0" "VMCREATE_SWAP_MB")
+create_swap_file /mnt/new "${VMCREATE_SWAP_MB:-8192}"
+
 # Bind mounts for chroot
 mount --bind /dev /mnt/new/dev
 mount --bind /proc /mnt/new/proc

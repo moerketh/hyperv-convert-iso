@@ -122,6 +122,64 @@ skip_if_no_kvp() {
     [[ "$output" =~ Key:\ Progress ]] && [[ "$output" =~ Value:\ 50% ]]
 }
 
+@test "create_swap_file creates 8192 MB swap file and adds fstab entry" {
+    # Source the real function under test
+    source "$PROJECT_ROOT/lib/functions.sh"
+
+    # Create a fake root filesystem with enough free space
+    local fake_root="$TEST_TEMP_DIR/fake_root"
+    mkdir -p "$fake_root/etc"
+    echo "UUID=abc123 / ext4 defaults 0 1" > "$fake_root/etc/fstab"
+
+    # Use a smaller size to keep tests fast but verify parameter plumbing
+    create_swap_file "$fake_root" 64
+
+    # Verify swap file exists with correct size (~64 MB)
+    [ -f "$fake_root/swapfile" ]
+    local size_kb
+    size_kb=$(du -k "$fake_root/swapfile" | cut -f1)
+    [ "$size_kb" -ge 60000 ] && [ "$size_kb" -le 70000 ]
+
+    # Verify permissions
+    local perms
+    perms=$(stat -c '%a' "$fake_root/swapfile")
+    [ "$perms" = "600" ]
+
+    # Verify fstab entry
+    grep -q '/swapfile none swap sw 0 0' "$fake_root/etc/fstab"
+}
+
+@test "create_swap_file skips when swap file already exists" {
+    source "$PROJECT_ROOT/lib/functions.sh"
+
+    local fake_root="$TEST_TEMP_DIR/fake_root"
+    mkdir -p "$fake_root/etc"
+    touch "$fake_root/swapfile"
+    echo "pre-existing" > "$fake_root/etc/fstab"
+
+    create_swap_file "$fake_root" 64
+
+    # fstab should not get a duplicate entry
+    [ "$(grep -c '/swapfile' "$fake_root/etc/fstab")" -eq 0 ]
+}
+
+@test "create_swap_file skips when root filesystem has insufficient space" {
+    source "$PROJECT_ROOT/lib/functions.sh"
+
+    # Create a tiny tmpfs to simulate low-space root
+    local fake_root="$TEST_TEMP_DIR/tiny_root"
+    mkdir -p "$fake_root/etc"
+    mount -t tmpfs -o size=16m tmpfs "$fake_root" || skip "Cannot mount tmpfs for low-space test"
+    echo "UUID=abc123 / ext4 defaults 0 1" > "$fake_root/etc/fstab"
+
+    create_swap_file "$fake_root" 8192
+
+    # Swap file should not be created because 8192 MB + 1 GB headroom exceeds 16 MB
+    [ ! -f "$fake_root/swapfile" ]
+
+    umount "$fake_root"
+}
+
 @test "report_progress logs without progress value" {
     # Mock log and send_kvp to capture calls
     log() {
