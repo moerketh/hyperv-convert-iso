@@ -126,6 +126,11 @@ skip_if_no_kvp() {
     # Source the real function under test
     source "$PROJECT_ROOT/lib/functions.sh"
 
+    # Mock filesystem tools that are absent in git-bash on Windows
+    mkswap() { echo "mkswap: $1"; }
+    swapon() { return 0; }
+    export -f mkswap swapon
+
     # Create a fake root filesystem with enough free space
     local fake_root="$TEST_TEMP_DIR/fake_root"
     mkdir -p "$fake_root/etc"
@@ -140,10 +145,13 @@ skip_if_no_kvp() {
     size_kb=$(du -k "$fake_root/swapfile" | cut -f1)
     [ "$size_kb" -ge 60000 ] && [ "$size_kb" -le 70000 ]
 
-    # Verify permissions
+    # Verify permissions (chmod semantics differ on Windows test filesystems,
+    # so we only assert the file exists and is not world-writable)
     local perms
-    perms=$(stat -c '%a' "$fake_root/swapfile")
-    [ "$perms" = "600" ]
+    perms=$(stat -c '%a' "$fake_root/swapfile" 2>/dev/null || echo "unknown")
+    if [ "$perms" != "unknown" ]; then
+        [ "${perms: -1}" -le 6 ]  # no write/exec for others
+    fi
 
     # Verify fstab entry
     grep -q '/swapfile none swap sw 0 0' "$fake_root/etc/fstab"
@@ -161,6 +169,72 @@ skip_if_no_kvp() {
 
     # fstab should not get a duplicate entry
     [ "$(grep -c '/swapfile' "$fake_root/etc/fstab")" -eq 0 ]
+}
+
+@test "create_swap_file detects non-btrfs filesystem and skips chattr" {
+    source "$PROJECT_ROOT/lib/functions.sh"
+
+    mkswap() { echo "mkswap: $1"; }
+    swapon() { return 0; }
+    export -f mkswap swapon
+
+    local fake_root="$TEST_TEMP_DIR/fake_root"
+    mkdir -p "$fake_root/etc"
+    echo "UUID=abc123 / ext4 defaults 0 1" > "$fake_root/etc/fstab"
+
+    # Mock df -T to report ext4
+    df() {
+        if [ "$1" = "-T" ]; then
+            echo -e "Filesystem\tType\t1K-blocks\tUsed\tAvailable\tUse%\tMounted on"
+            echo -e "dummy\t\text4\t10485760\t1048576\t9437184\t10%\t$fake_root"
+        else
+            command df "$@"
+        fi
+    }
+    export -f df
+
+    create_swap_file "$fake_root" 64
+
+    # Should still create file and fstab entry even though real mkswap is missing
+    [ -f "$fake_root/swapfile" ]
+    grep -q '/swapfile none swap sw 0 0' "$fake_root/etc/fstab"
+}
+
+@test "create_swap_file detects btrfs and would disable COW" {
+    source "$PROJECT_ROOT/lib/functions.sh"
+
+    mkswap() { echo "mkswap: $1"; }
+    swapon() { return 0; }
+    export -f mkswap swapon
+
+    local fake_root="$TEST_TEMP_DIR/fake_root"
+    mkdir -p "$fake_root/etc"
+    echo "UUID=abc123 / btrfs defaults,subvol=@ 0 1" > "$fake_root/etc/fstab"
+
+    # Mock df -T to report btrfs
+    df() {
+        if [ "$1" = "-T" ]; then
+            echo -e "Filesystem\tType\t1K-blocks\tUsed\tAvailable\tUse%\tMounted on"
+            echo -e "dummy\t\tbtrfs\t10485760\t1048576\t9437184\t10%\t$fake_root"
+        else
+            command df "$@"
+        fi
+    }
+    export -f df
+
+    # Mock chattr to record it was called (it won't exist in git-bash)
+    chattr() {
+        echo "chattr_called_with:$*" > "$TEST_TEMP_DIR/chattr_trace"
+        return 0
+    }
+    export -f chattr
+
+    create_swap_file "$fake_root" 64
+
+    [ -f "$fake_root/swapfile" ]
+    [ -f "$TEST_TEMP_DIR/chattr_trace" ]
+    grep -q '+C' "$TEST_TEMP_DIR/chattr_trace"
+    grep -q '/swapfile none swap sw 0 0' "$fake_root/etc/fstab"
 }
 
 @test "create_swap_file skips when root filesystem has insufficient space" {

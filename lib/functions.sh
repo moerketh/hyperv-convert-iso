@@ -1262,6 +1262,10 @@ HOOK
 # security tooling can exhaust RAM and hang the VM, so we create a swap
 # file by default. The size can be overridden via the VMCREATE_SWAP_MB
 # KVP key; if omitted, 8192 MB is used.
+#
+# Btrfs requires the swap file to be created with copy-on-write disabled
+# *before* any data is written; otherwise swapon fails with EINVAL and
+# the kernel logs "swapfile must not be copy-on-write".
 # Usage: create_swap_file /mnt/new [size_in_mb]
 create_swap_file() {
     local root="${1:-/mnt/new}"
@@ -1283,7 +1287,26 @@ create_swap_file() {
         return 0
     fi
 
-    echo "Creating ${swap_size_mb}MB swap file..."
+    # Detect Btrfs and disable COW before allocating the file
+    local fs_type
+    fs_type=$(findmnt -n -o FSTYPE "$root" 2>/dev/null || df -T "$root" 2>/dev/null | tail -n 1 | awk '{print $2}')
+
+    echo "Creating ${swap_size_mb}MB swap file on ${fs_type:-unknown} filesystem..."
+
+    if [ "$fs_type" = "btrfs" ]; then
+        # COW must be disabled on an empty file before any write happens.
+        if ! touch "$swapfile"; then
+            echo "WARNING: Failed to create empty swap file on Btrfs" | tee -a /tmp/error.log
+            return 0
+        fi
+        if ! chattr +C "$swapfile" 2>/dev/null; then
+            rm -f "$swapfile"
+            echo "WARNING: Failed to disable Btrfs copy-on-write for swap file" | tee -a /tmp/error.log
+            return 0
+        fi
+        echo "Disabled Btrfs copy-on-write for swap file"
+    fi
+
     if fallocate -l "${swap_size_mb}M" "$swapfile" 2>/dev/null; then
         echo "Allocated ${swap_size_mb}MB swap file with fallocate"
     else
@@ -1304,6 +1327,15 @@ create_swap_file() {
     if [ -f "$fstab" ] && ! grep -q '/swapfile' "$fstab"; then
         echo "/swapfile none swap sw 0 0" >> "$fstab"
         echo "Added swap file entry to fstab"
+    fi
+
+    # Activate swap immediately if possible (catches Btrfs COW and other
+    # filesystem issues while the ISO environment still has a chance to
+    # report them, rather than silently failing on first boot).
+    if swapon "$swapfile" 2>/dev/null; then
+        echo "Activated swap file"
+    else
+        echo "WARNING: Swap file created but could not be activated in the live environment; it should activate from fstab on next boot" | tee -a /tmp/error.log
     fi
 }
 
